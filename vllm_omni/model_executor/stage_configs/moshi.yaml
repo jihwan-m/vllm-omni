@@ -1,0 +1,81 @@
+# Stage config for running Moshi with 2-stage architecture (Phase 1: half-duplex)
+# Stage 0: Dialogue (Temporal Transformer + Depth Transformer)
+#   - Input: user audio codes (Mimi-encoded)
+#   - Output: text tokens + 8-level RVQ audio codes
+# Stage 1: Mimi Decode (Neural audio codec decoder)
+#   - Input: RVQ audio codes from Stage 0
+#   - Output: audio waveform at 24kHz
+#
+# Model: kmhf/hf-moshiko (HuggingFace Transformers format)
+# Reference: https://arxiv.org/abs/2410.00037
+#
+# Hardware: Tested conceptually for 1x H100-80G GPU
+# (Moshi 7B ~14GB + Mimi 96M ~0.2GB = ~14.2GB in bf16)
+
+async_chunk: false
+
+stage_args:
+  # ===== STAGE 0: Moshi Dialogue =====
+  # Temporal Transformer (7B, 32L, 4096H) generates text tokens.
+  # Depth Transformer (6L, 1024H) generates 8 audio codebook tokens per step.
+  # Runs at 12.5Hz (one step per 80ms frame).
+  - stage_id: 0
+    stage_type: llm
+    runtime:
+      devices: "0"
+      max_batch_size: 1  # Moshi runs one conversation at a time
+    engine_args:
+      model_stage: dialogue
+      model_arch: MoshiForConditionalGenerationVLLM
+      worker_type: generation  # Non-AR: runs complete inference loop in forward()
+      scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
+      gpu_memory_utilization: 0.85
+      enforce_eager: true
+      trust_remote_code: true
+      engine_output_type: latent  # Output audio codes for next stage
+      enable_prefix_caching: false
+      distributed_executor_backend: "mp"
+      max_num_batched_tokens: 65536
+      tensor_parallel_size: 1
+    final_output: true
+    final_output_type: text  # Inner monologue text
+    is_comprehension: true
+    default_sampling_params:
+      temperature: 0.7
+      top_k: 50
+      max_tokens: 16384  # ~1310 seconds at 12.5Hz
+      seed: 42
+      detokenize: false
+
+  # ===== STAGE 1: Mimi Decode =====
+  # Converts 8-level RVQ codes to audio waveform.
+  # Mimi: 96M params, streaming causal codec, 24kHz output.
+  - stage_id: 1
+    stage_type: llm
+    runtime:
+      devices: "0"  # Share GPU with dialogue stage (Mimi is very small)
+      max_batch_size: 1
+    engine_args:
+      model_stage: mimi_decode
+      model_arch: MoshiForConditionalGenerationVLLM
+      worker_type: generation
+      scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
+      gpu_memory_utilization: 0.05
+      enforce_eager: true
+      trust_remote_code: true
+      engine_output_type: audio
+      async_scheduling: false
+      enable_prefix_caching: false
+      distributed_executor_backend: "mp"
+      max_num_batched_tokens: 500000
+    engine_input_source: [0]
+    custom_process_input_func: vllm_omni.model_executor.stage_input_processors.moshi.dialogue_to_mimi_decode
+    final_output: true
+    final_output_type: audio
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 65536
+      seed: 42
+      detokenize: false

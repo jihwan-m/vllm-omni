@@ -53,6 +53,12 @@ _OMNI_MODELS = {
         "qwen3_tts",
         "Qwen3TTSModelForGeneration",
     ),
+    # Moshi (Kyutai) - Full-duplex speech-to-speech model
+    "MoshiForConditionalGenerationVLLM": (
+        "moshi",
+        "moshi",
+        "MoshiForConditionalGenerationVLLM",
+    ),
 }
 
 
