@@ -10,13 +10,13 @@ enabling natural conversational overlap, barge-in, and back-channeling.
 
 ## Prerequisites
 
-| Requirement | Minimum |
-|---|---|
-| OS | Linux |
-| Python | 3.10+ (3.12 recommended) |
-| GPU | 1x NVIDIA H100-80G (or A100-80G) |
-| CUDA | 12.1+ |
-| VRAM | ~35 GB for 7B dialogue model |
+| Requirement | FP16 (default) | INT4 (quantized) |
+|---|---|---|
+| OS | Linux | Linux |
+| Python | 3.10+ (3.12 recommended) | 3.10+ (3.12 recommended) |
+| GPU | 1x H100-80G / A100-80G | 1x RTX 4070 Ti Super (16 GB+) |
+| CUDA | 12.1+ | 12.1+ |
+| VRAM | ~35 GB | ~8–12 GB |
 
 ## 1. Installation
 
@@ -84,6 +84,34 @@ huggingface-cli download kmhf/hf-moshiko
 | Frame rate | 12.5 Hz — one forward pass per 80 ms of audio |
 | Codebooks | 8 RVQ levels per frame |
 
+### Quantized model (for 16 GB GPUs)
+
+The temporal transformer supports INT4 quantization (AWQ, GPTQ) which
+reduces weights from ~14 GB to ~3.5 GB, enabling inference on consumer
+GPUs like the RTX 4070 Ti Super (16 GB) or RTX 4090 (24 GB).
+
+To create an AWQ-quantized checkpoint:
+
+```bash
+pip install autoawq
+
+python -c "
+from awq import AutoAWQForCausalLM
+from transformers import AutoTokenizer
+
+model = AutoAWQForCausalLM.from_pretrained('kmhf/hf-moshiko')
+model.quantize(
+    tokenizer=None,
+    quant_config={'w_bit': 4, 'q_group_size': 128, 'zero_point': True},
+)
+model.save_quantized('kmhf/hf-moshiko-awq')
+"
+```
+
+Only the temporal transformer (7B, 32 layers) is quantized. The depth
+transformer uses 3D per-codebook weights (`MoshiFlexibleLinear`) which
+remain in FP16 — its footprint is negligible.
+
 ## 3. Stage Configuration
 
 Full-duplex mode uses a dedicated stage config that bypasses the standard
@@ -139,6 +167,23 @@ vllm serve kmhf/hf-moshiko \
   --gpu-memory-utilization 0.90 \
   --trust-remote-code
 ```
+
+### Start with quantized model (16 GB GPU)
+
+```bash
+vllm serve kmhf/hf-moshiko-awq \
+  --omni \
+  --port 8000 \
+  --host 0.0.0.0 \
+  --stage-configs-path vllm_omni/model_executor/stage_configs/moshi_duplex_quantized.yaml \
+  --quantization awq \
+  --gpu-memory-utilization 0.95 \
+  --trust-remote-code
+```
+
+The quantized stage config (`moshi_duplex_quantized.yaml`) has tighter
+limits tuned for 16 GB VRAM: shorter max duration (120 s), smaller ring
+buffer (128 frames), and lower KV cache limit (1500 steps).
 
 ### CLI flags reference
 
