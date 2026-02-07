@@ -142,22 +142,40 @@ if [ "$SKIP_INSTALL" = false ]; then
 
     # Create venv if not active
     if [ -z "${VIRTUAL_ENV:-}" ]; then
-        if [ ! -d "$REPO_ROOT/.venv" ]; then
+        # Locate the activate script (cross-platform)
+        _find_activate() {
+            for candidate in \
+                "$REPO_ROOT/.venv/Scripts/activate" \
+                "$REPO_ROOT/.venv/bin/activate"; do
+                if [ -f "$candidate" ]; then
+                    echo "$candidate"
+                    return 0
+                fi
+            done
+            return 1
+        }
+
+        if ! _find_activate &>/dev/null; then
             echo "Creating Python virtual environment..."
+            # Remove broken venv if it exists without an activate script
+            [ -d "$REPO_ROOT/.venv" ] && rm -rf "$REPO_ROOT/.venv"
             $PYTHON -m venv "$REPO_ROOT/.venv"
         fi
-        echo "Activating virtual environment..."
-        # Cross-platform: Windows (Git Bash/MINGW) uses Scripts/, Linux/Mac uses bin/
-        if [ -f "$REPO_ROOT/.venv/Scripts/activate" ]; then
-            source "$REPO_ROOT/.venv/Scripts/activate"
-        elif [ -f "$REPO_ROOT/.venv/bin/activate" ]; then
-            source "$REPO_ROOT/.venv/bin/activate"
-        else
-            echo "ERROR: Could not find venv activate script."
-            echo "  Looked in: $REPO_ROOT/.venv/Scripts/activate"
-            echo "             $REPO_ROOT/.venv/bin/activate"
+
+        ACTIVATE_SCRIPT="$(_find_activate)" || {
+            echo "ERROR: Could not find venv activate script after creation."
+            echo "  Contents of .venv/:"
+            ls -R "$REPO_ROOT/.venv/" 2>/dev/null | head -30
+            echo ""
+            echo "Try creating a venv manually:"
+            echo "  $PYTHON -m venv .venv"
+            echo "  source .venv/Scripts/activate   # Windows/Git Bash"
+            echo "  source .venv/bin/activate        # Linux/Mac"
+            echo "Then re-run with: bash $0 --skip-install --quantized"
             exit 1
-        fi
+        }
+        echo "Activating virtual environment ($ACTIVATE_SCRIPT)..."
+        source "$ACTIVATE_SCRIPT"
     else
         echo "Using active venv: $VIRTUAL_ENV"
     fi
