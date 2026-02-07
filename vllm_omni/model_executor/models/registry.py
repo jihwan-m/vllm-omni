@@ -59,6 +59,12 @@ _OMNI_MODELS = {
         "moshi",
         "MoshiForConditionalGenerationVLLM",
     ),
+    # HF config uses this name — alias to our VLLM class
+    "MoshiForConditionalGeneration": (
+        "moshi",
+        "moshi",
+        "MoshiForConditionalGenerationVLLM",
+    ),
 }
 
 
