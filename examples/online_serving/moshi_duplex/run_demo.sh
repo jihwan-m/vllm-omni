@@ -32,6 +32,16 @@ else
     exit 1
 fi
 
+# ----------------------------- Package Installer Detection -------------------
+# Prefer uv (10-100x faster than pip) if available
+if command -v uv &>/dev/null; then
+    PIP="uv pip"
+    echo "Using uv for fast package installation."
+else
+    PIP="pip"
+    echo "Note: Install 'uv' for much faster installs: pip install uv"
+fi
+
 # ----------------------------- Configuration ---------------------------------
 
 MODEL="kmhf/hf-moshiko"
@@ -182,15 +192,15 @@ if [ "$SKIP_INSTALL" = false ]; then
 
     # Install vLLM
     echo "Installing vLLM..."
-    pip install -q vllm 2>&1 | tail -1
+    $PIP install -q vllm 2>&1 | tail -1
 
     # Install vllm-omni
     echo "Installing vllm-omni..."
-    pip install -q -e "$REPO_ROOT" 2>&1 | tail -1
+    $PIP install -q -e "$REPO_ROOT" 2>&1 | tail -1
 
     # Install client dependencies
     echo "Installing client dependencies (websockets, numpy)..."
-    pip install -q websockets numpy 2>&1 | tail -1
+    $PIP install -q websockets numpy 2>&1 | tail -1
 
     echo "Done."
 else
