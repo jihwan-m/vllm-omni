@@ -21,6 +21,17 @@
 
 set -euo pipefail
 
+# ----------------------------- Python Detection ------------------------------
+# On Windows (MINGW/MSYS), Python is typically 'python', not 'python3'
+if command -v python3 &>/dev/null; then
+    PYTHON=python3
+elif command -v python &>/dev/null; then
+    PYTHON=python
+else
+    echo "ERROR: Python not found. Install Python 3.10+ and ensure it's on PATH."
+    exit 1
+fi
+
 # ----------------------------- Configuration ---------------------------------
 
 MODEL="kmhf/hf-moshiko"
@@ -133,10 +144,20 @@ if [ "$SKIP_INSTALL" = false ]; then
     if [ -z "${VIRTUAL_ENV:-}" ]; then
         if [ ! -d "$REPO_ROOT/.venv" ]; then
             echo "Creating Python virtual environment..."
-            python3 -m venv "$REPO_ROOT/.venv"
+            $PYTHON -m venv "$REPO_ROOT/.venv"
         fi
         echo "Activating virtual environment..."
-        source "$REPO_ROOT/.venv/bin/activate"
+        # Cross-platform: Windows (Git Bash/MINGW) uses Scripts/, Linux/Mac uses bin/
+        if [ -f "$REPO_ROOT/.venv/Scripts/activate" ]; then
+            source "$REPO_ROOT/.venv/Scripts/activate"
+        elif [ -f "$REPO_ROOT/.venv/bin/activate" ]; then
+            source "$REPO_ROOT/.venv/bin/activate"
+        else
+            echo "ERROR: Could not find venv activate script."
+            echo "  Looked in: $REPO_ROOT/.venv/Scripts/activate"
+            echo "             $REPO_ROOT/.venv/bin/activate"
+            exit 1
+        fi
     else
         echo "Using active venv: $VIRTUAL_ENV"
     fi
@@ -162,7 +183,10 @@ fi
 # ----------------------------- Step 2: Server --------------------------------
 
 SERVER_PID=""
-LOG_FILE="/tmp/moshi_duplex_server_${PORT}.log"
+# Cross-platform temp directory
+TMPDIR="${TMPDIR:-${TEMP:-${TMP:-/tmp}}}"
+LOG_FILE="${TMPDIR}/moshi_duplex_server_${PORT}.log"
+OUTPUT_FILE="${TMPDIR}/moshi_output.pcm"
 
 cleanup() {
     echo ""
@@ -258,11 +282,11 @@ echo "Connecting to ws://localhost:${PORT}/v1/audio/duplex"
 echo "Sending ${DURATION}s of synthetic audio (sine wave at 440 Hz)"
 echo ""
 
-python3 "$SCRIPT_DIR/client_demo.py" \
+$PYTHON "$SCRIPT_DIR/client_demo.py" \
     --url "ws://localhost:${PORT}/v1/audio/duplex" \
     --duration "$DURATION" \
     --duplex \
-    --output "/tmp/moshi_output.pcm"
+    --output "$OUTPUT_FILE"
 
 # ----------------------------- Step 4: Summary -------------------------------
 
@@ -270,11 +294,11 @@ echo ""
 echo "[4/4] Demo complete!"
 echo "--------------------------------------"
 echo ""
-echo "  Output audio: /tmp/moshi_output.pcm"
+echo "  Output audio: $OUTPUT_FILE"
 echo "  Server log:   $LOG_FILE"
 echo ""
-echo "  Play output:  ffplay -f s16le -ar 24000 -ac 1 /tmp/moshi_output.pcm"
-echo "  Or with sox:  play -t raw -r 24000 -e signed -b 16 -c 1 /tmp/moshi_output.pcm"
+echo "  Play output:  ffplay -f s16le -ar 24000 -ac 1 $OUTPUT_FILE"
+echo "  Or with sox:  play -t raw -r 24000 -e signed -b 16 -c 1 $OUTPUT_FILE"
 echo ""
 
 if [ "$CLIENT_ONLY" = false ]; then
