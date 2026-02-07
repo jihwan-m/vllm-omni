@@ -63,7 +63,7 @@ class MoshiRotaryEmbedding(nn.Module):
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
     def forward(self, x: torch.Tensor, position_ids: torch.Tensor):
-        freqs = torch.einsum("i,j->ij", position_ids.float().squeeze(), self.inv_freq)
+        freqs = torch.einsum("i,j->ij", position_ids.float().reshape(-1), self.inv_freq)
         emb = torch.cat([freqs, freqs], dim=-1)
         cos = emb.cos().unsqueeze(0)
         sin = emb.sin().unsqueeze(0)
