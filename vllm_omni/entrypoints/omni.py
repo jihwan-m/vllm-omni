@@ -874,10 +874,12 @@ class Omni(OmniBase):
         Yields OmniStreamingChunk objects as audio chunks become available.
         This is used by the WebSocket handler for real-time audio streaming.
 
-        Unlike _run_generation(), this method:
-        - Yields partial outputs before full completion
-        - Tracks per-chunk indices for client-side reassembly
-        - Returns OmniStreamingChunk (lightweight) instead of OmniRequestOutput
+        Two modes of operation:
+        1. **Per-step streaming** (async_chunk=True): Drives the dialogue model
+           step-by-step using forward_dialogue_step(), yielding audio codes
+           after each temporal step. This produces true incremental output.
+        2. **Full-pipeline fallback** (async_chunk=False): Runs the complete
+           pipeline via _run_generation() and yields a single final chunk.
 
         Args:
             request_id: Unique session/request ID.
@@ -893,57 +895,148 @@ class Omni(OmniBase):
             self._name, request_id, len(audio_token_ids), max_duration_s,
         )
 
-        # For async_chunk pipelines, we use the existing multi-stage
-        # orchestrator and yield intermediate results as they appear.
-        # For non-async_chunk (or when we have a direct model reference),
-        # we can run the per-step loop here.
-
         if not self.async_chunk:
             # Non-streaming fallback: run full pipeline, yield single chunk
-            from vllm.sampling_params import SamplingParams
-
-            sp_list = []
-            for stage in self.stage_list:
-                default_sp = getattr(stage, "default_sampling_params", None)
-                if default_sp:
-                    sp_list.append(SamplingParams(**default_sp))
-                else:
-                    sp_list.append(SamplingParams(temperature=temperature, top_k=top_k))
-
-            prompt = {"prompt_token_ids": audio_token_ids}
-
-            for output in self._run_generation(
-                prompts=[prompt],
-                sampling_params_list=sp_list,
-                use_tqdm=False,
-            ):
-                # Convert final output to streaming chunk
-                audio_data = None
-                mm_out = output.multimodal_output
-                if mm_out and "model_outputs" in mm_out:
-                    import struct
-                    tensor = mm_out["model_outputs"]
-                    if hasattr(tensor, "cpu"):
-                        tensor = tensor.cpu()
-                    if hasattr(tensor, "numpy"):
-                        import numpy as np
-                        audio_np = tensor.squeeze().numpy().astype(np.float32)
-                        # Convert float32 to int16 PCM
-                        audio_int16 = (audio_np * 32767).clip(-32768, 32767).astype(np.int16)
-                        audio_data = audio_int16.tobytes()
-
-                yield OmniStreamingChunk(
-                    stage_id=output.stage_id or 0,
-                    chunk_index=0,
-                    audio_data=audio_data,
-                    is_final=True,
-                )
+            yield from self._generate_streaming_full_pipeline(
+                request_id, audio_token_ids, temperature, top_k,
+            )
             return
 
-        # Async-chunk streaming: poll for intermediate chunks from the
-        # pipeline stages as they complete, yielding each one.
-        from vllm.sampling_params import SamplingParams
+        # Per-step streaming: drive the dialogue model step-by-step,
+        # yielding audio codes incrementally instead of waiting for the
+        # full pipeline to complete.
+        yield from self._generate_streaming_per_step(
+            request_id, audio_token_ids, temperature, top_k, max_duration_s,
+        )
 
+    def _generate_streaming_full_pipeline(
+        self,
+        request_id: str,
+        audio_token_ids: list[int],
+        temperature: float,
+        top_k: int,
+    ) -> Generator["OmniStreamingChunk", None, None]:
+        """Fallback: run full pipeline and yield a single final chunk."""
+        from vllm_omni.outputs import OmniStreamingChunk
+
+        sp_list = self._build_sampling_params(temperature, top_k)
+        prompt = {"prompt_token_ids": audio_token_ids}
+
+        for output in self._run_generation(
+            prompts=[prompt],
+            sampling_params_list=sp_list,
+            use_tqdm=False,
+        ):
+            audio_data = self._extract_pcm_audio(output)
+            yield OmniStreamingChunk(
+                stage_id=output.stage_id or 0,
+                chunk_index=0,
+                audio_data=audio_data,
+                is_final=True,
+            )
+
+        logger.info(
+            "[%s] Full-pipeline streaming complete for %s",
+            self._name, request_id,
+        )
+
+    def _generate_streaming_per_step(
+        self,
+        request_id: str,
+        audio_token_ids: list[int],
+        temperature: float,
+        top_k: int,
+        max_duration_s: float,
+    ) -> Generator["OmniStreamingChunk", None, None]:
+        """Per-step streaming: drive dialogue model step-by-step.
+
+        Instead of delegating to _run_generation() (which only yields at
+        final stages), this method directly calls forward_dialogue_step()
+        on the dialogue stage model, yielding audio codes after each
+        temporal step. This enables true incremental audio streaming.
+
+        The user audio token IDs are unflatten from [8*T] to per-step
+        codes [T][8], then fed one frame at a time.
+        """
+        import math
+
+        from vllm_omni.outputs import OmniStreamingChunk
+
+        num_codebooks = 8  # Moshi standard
+        frame_rate = 12.5  # Moshi: 12.5 Hz (80ms per frame)
+        max_steps = int(max_duration_s * frame_rate)
+
+        # Unflatten input: [8*T] → list of [8] per-frame codes
+        num_input_frames = len(audio_token_ids) // num_codebooks
+        user_frames: list[list[int]] = []
+        for i in range(num_input_frames):
+            frame = audio_token_ids[i * num_codebooks : (i + 1) * num_codebooks]
+            user_frames.append(frame)
+
+        # Determine output length: at least as long as input, capped by max
+        num_output_steps = min(max(num_input_frames, 1), max_steps)
+
+        # Submit to the pipeline — we get the model ref from stage 0
+        # and drive the per-step loop directly
+        stage0 = self.stage_list[0]
+        model = getattr(stage0, "_model", None)
+
+        # If we can't access the model directly (e.g., model runs in a
+        # separate process via Ray), fall back to full pipeline
+        if model is None or not hasattr(model, "forward_dialogue_step"):
+            logger.warning(
+                "[%s] Model does not support per-step streaming, "
+                "falling back to full pipeline for %s",
+                self._name, request_id,
+            )
+            yield from self._generate_streaming_full_pipeline(
+                request_id, audio_token_ids, temperature, top_k,
+            )
+            return
+
+        # Initialize per-request streaming state
+        model.init_streaming_state(request_id=request_id)
+        chunk_index = 0
+
+        try:
+            for step in range(num_output_steps):
+                # Get user audio for this step (silence if past input length)
+                if step < len(user_frames):
+                    user_codes = user_frames[step]
+                else:
+                    user_codes = None  # silence padding
+
+                # Run one temporal + depth step
+                result = model.forward_dialogue_step(
+                    user_audio_codes=user_codes,
+                    temperature=temperature,
+                    top_k=top_k,
+                    request_id=request_id,
+                )
+
+                is_final = (step == num_output_steps - 1)
+
+                yield OmniStreamingChunk(
+                    stage_id=0,
+                    chunk_index=chunk_index,
+                    audio_codes=result["audio_codes"],
+                    text_token=result["text_token"],
+                    is_final=is_final,
+                )
+                chunk_index += 1
+
+        finally:
+            model.clear_streaming_state(request_id=request_id)
+
+        logger.info(
+            "[%s] Per-step streaming complete for %s (%d chunks)",
+            self._name, request_id, chunk_index,
+        )
+
+    def _build_sampling_params(
+        self, temperature: float, top_k: int,
+    ) -> list:
+        """Build per-stage sampling params list."""
         sp_list = []
         for stage in self.stage_list:
             default_sp = getattr(stage, "default_sampling_params", None)
@@ -951,39 +1044,24 @@ class Omni(OmniBase):
                 sp_list.append(SamplingParams(**default_sp))
             else:
                 sp_list.append(SamplingParams(temperature=temperature, top_k=top_k))
+        return sp_list
 
-        prompt = {"prompt_token_ids": audio_token_ids}
+    @staticmethod
+    def _extract_pcm_audio(output: "OmniRequestOutput") -> bytes | None:
+        """Extract PCM int16 audio bytes from a pipeline output."""
+        mm_out = output.multimodal_output
+        if not mm_out or "model_outputs" not in mm_out:
+            return None
+        import numpy as np
 
-        chunk_index = 0
-        for output in self._run_generation(
-            prompts=[prompt],
-            sampling_params_list=sp_list,
-            use_tqdm=False,
-        ):
-            audio_data = None
-            mm_out = output.multimodal_output
-            if mm_out and "model_outputs" in mm_out:
-                import numpy as np
-                tensor = mm_out["model_outputs"]
-                if hasattr(tensor, "cpu"):
-                    tensor = tensor.cpu()
-                if hasattr(tensor, "numpy"):
-                    audio_np = tensor.squeeze().numpy().astype(np.float32)
-                    audio_int16 = (audio_np * 32767).clip(-32768, 32767).astype(np.int16)
-                    audio_data = audio_int16.tobytes()
-
-            yield OmniStreamingChunk(
-                stage_id=output.stage_id or 0,
-                chunk_index=chunk_index,
-                audio_data=audio_data,
-                is_final=output.finished,
-            )
-            chunk_index += 1
-
-        logger.info(
-            "[%s] Streaming generation complete for %s (%d chunks)",
-            self._name, request_id, chunk_index,
-        )
+        tensor = mm_out["model_outputs"]
+        if hasattr(tensor, "cpu"):
+            tensor = tensor.cpu()
+        if hasattr(tensor, "numpy"):
+            audio_np = tensor.squeeze().numpy().astype(np.float32)
+            audio_int16 = (audio_np * 32767).clip(-32768, 32767).astype(np.int16)
+            return audio_int16.tobytes()
+        return None
 
     @property
     def _name(self) -> str:

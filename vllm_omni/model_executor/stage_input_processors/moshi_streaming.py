@@ -105,7 +105,7 @@ def dialogue_to_mimi_async_chunk(
 
     return {
         "code_predictor_codes": flat_codes,
-        "finished": torch.tensor(is_finished, dtype=torch.bool),
+        "finished": bool(is_finished),
         "chunk_index": chunk_id,
         "num_frames": chunk_length,
     }

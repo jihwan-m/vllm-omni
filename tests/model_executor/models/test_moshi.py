@@ -854,7 +854,6 @@ class TestForwardDialogueStep:
         ])
         model.decoder = MoshiTemporalDecoder(config)
         model.depth_decoder = MoshiDepthDecoder(config.depth_decoder_config)
-        model._streaming_state = None
 
         # Bind the methods from the real class
         import types
@@ -874,9 +873,10 @@ class TestForwardDialogueStep:
 
     def test_init_streaming_state(self, streaming_model, device):
         """Test that streaming state is properly initialized."""
-        streaming_model.init_streaming_state(device)
-        state = streaming_model._streaming_state
-        assert state is not None
+        streaming_model.init_streaming_state(request_id="test1", device=device)
+        states = streaming_model._streaming_states
+        assert "test1" in states
+        state = states["test1"]
         assert state["past_key_values"] is None
         assert state["prev_text_token"] is None
         assert state["prev_audio_codes"] is None
@@ -884,11 +884,12 @@ class TestForwardDialogueStep:
 
     def test_single_step(self, streaming_model, device):
         """Test running a single dialogue step."""
-        streaming_model.init_streaming_state(device)
+        streaming_model.init_streaming_state(request_id="test1", device=device)
         result = streaming_model.forward_dialogue_step(
             user_audio_codes=[0, 0, 0, 0],
             temperature=0.0,
             top_k=0,
+            request_id="test1",
         )
 
         assert "audio_codes" in result
@@ -900,19 +901,20 @@ class TestForwardDialogueStep:
 
     def test_multi_step_state_accumulation(self, streaming_model, device):
         """Test that state accumulates across multiple steps."""
-        streaming_model.init_streaming_state(device)
+        streaming_model.init_streaming_state(request_id="test1", device=device)
 
         results = []
         for t in range(5):
             result = streaming_model.forward_dialogue_step(
                 user_audio_codes=[0] * streaming_model.num_codebooks,
                 temperature=0.0,
+                request_id="test1",
             )
             results.append(result)
             assert result["temporal_step"] == t
 
         # Verify KV cache has grown
-        state = streaming_model._streaming_state
+        state = streaming_model._streaming_states["test1"]
         assert state["temporal_step"] == 5
         assert state["past_key_values"] is not None
         # First layer's k cache should have 5 positions
@@ -921,31 +923,32 @@ class TestForwardDialogueStep:
     def test_step_without_init_raises(self, streaming_model):
         """Test that calling forward_dialogue_step without init raises."""
         with pytest.raises(RuntimeError, match="Streaming state not initialized"):
-            streaming_model.forward_dialogue_step()
+            streaming_model.forward_dialogue_step(request_id="nonexistent")
 
     def test_clear_streaming_state(self, streaming_model, device):
         """Test that state is properly cleared."""
-        streaming_model.init_streaming_state(device)
+        streaming_model.init_streaming_state(request_id="test1", device=device)
         streaming_model.forward_dialogue_step(
             user_audio_codes=[0] * streaming_model.num_codebooks,
+            request_id="test1",
         )
-        assert streaming_model._streaming_state is not None
-        streaming_model.clear_streaming_state()
-        assert streaming_model._streaming_state is None
+        assert "test1" in streaming_model._streaming_states
+        streaming_model.clear_streaming_state(request_id="test1")
+        assert "test1" not in streaming_model._streaming_states
 
     def test_deterministic_with_zero_temp(self, streaming_model, device):
         """Test that zero temperature gives deterministic results."""
         user_codes = [1, 2, 3, 4]
 
-        streaming_model.init_streaming_state(device)
+        streaming_model.init_streaming_state(request_id="run1", device=device)
         r1 = streaming_model.forward_dialogue_step(
-            user_audio_codes=user_codes, temperature=0.0,
+            user_audio_codes=user_codes, temperature=0.0, request_id="run1",
         )
-        streaming_model.clear_streaming_state()
+        streaming_model.clear_streaming_state(request_id="run1")
 
-        streaming_model.init_streaming_state(device)
+        streaming_model.init_streaming_state(request_id="run2", device=device)
         r2 = streaming_model.forward_dialogue_step(
-            user_audio_codes=user_codes, temperature=0.0,
+            user_audio_codes=user_codes, temperature=0.0, request_id="run2",
         )
 
         assert r1["audio_codes"] == r2["audio_codes"]
@@ -953,11 +956,40 @@ class TestForwardDialogueStep:
 
     def test_none_user_codes_uses_silence(self, streaming_model, device):
         """Test that None user_audio_codes defaults to silence."""
-        streaming_model.init_streaming_state(device)
+        streaming_model.init_streaming_state(request_id="test1", device=device)
         result = streaming_model.forward_dialogue_step(
-            user_audio_codes=None, temperature=0.0,
+            user_audio_codes=None, temperature=0.0, request_id="test1",
         )
         assert len(result["audio_codes"]) == streaming_model.num_codebooks
+
+    def test_concurrent_requests_isolated(self, streaming_model, device):
+        """Test that multiple concurrent requests have independent state."""
+        streaming_model.init_streaming_state(request_id="req_a", device=device)
+        streaming_model.init_streaming_state(request_id="req_b", device=device)
+
+        # Step req_a forward 3 times
+        for _ in range(3):
+            streaming_model.forward_dialogue_step(
+                user_audio_codes=[0] * streaming_model.num_codebooks,
+                temperature=0.0,
+                request_id="req_a",
+            )
+
+        # Step req_b forward 1 time
+        streaming_model.forward_dialogue_step(
+            user_audio_codes=[1] * streaming_model.num_codebooks,
+            temperature=0.0,
+            request_id="req_b",
+        )
+
+        # Verify independent state
+        assert streaming_model._streaming_states["req_a"]["temporal_step"] == 3
+        assert streaming_model._streaming_states["req_b"]["temporal_step"] == 1
+
+        # Clear one without affecting the other
+        streaming_model.clear_streaming_state(request_id="req_a")
+        assert "req_a" not in streaming_model._streaming_states
+        assert "req_b" in streaming_model._streaming_states
 
 
 # =============================================================================
@@ -1059,7 +1091,7 @@ class TestDialogueToMimiAsyncChunk:
         assert result is not None
         # 4 frames * 8 codebooks = 32 codes
         assert len(result["code_predictor_codes"]) == 4 * MOSHI_NUM_CODEBOOKS
-        assert result["finished"].item() is True
+        assert result["finished"] is True
 
     def test_missing_audio_codes_returns_none(self):
         """Processor should return None when audio_codes is missing."""
@@ -1240,3 +1272,104 @@ class TestOmniStreamingChunk:
         )
         assert chunk.error == "Pipeline failed"
         assert chunk.is_final is True
+
+
+# =============================================================================
+# Phase 2 Pre-Phase-3 Fixes: Duration Calculation
+# =============================================================================
+
+
+class TestComputePcmDurationMs:
+    """Test the duration calculation helper for audio chunks."""
+
+    def test_pcm_s16le_duration(self):
+        from vllm_omni.entrypoints.openai.serving_duplex import _compute_pcm_duration_ms
+        # 48000 samples at 24kHz = 2 seconds = 2000 ms
+        # 48000 samples * 2 bytes/sample = 96000 bytes
+        duration = _compute_pcm_duration_ms(b"\x00" * 96000, 24000, "pcm_s16le")
+        assert abs(duration - 2000.0) < 0.1
+
+    def test_pcm_f32le_duration(self):
+        from vllm_omni.entrypoints.openai.serving_duplex import _compute_pcm_duration_ms
+        # 24000 samples at 24kHz = 1 second = 1000 ms
+        # 24000 samples * 4 bytes/sample = 96000 bytes
+        duration = _compute_pcm_duration_ms(b"\x00" * 96000, 24000, "pcm_f32le")
+        assert abs(duration - 1000.0) < 0.1
+
+    def test_opus_returns_zero(self):
+        from vllm_omni.entrypoints.openai.serving_duplex import _compute_pcm_duration_ms
+        # Compressed formats can't compute duration from byte length
+        duration = _compute_pcm_duration_ms(b"\x00" * 1000, 24000, "opus")
+        assert duration == 0.0
+
+    def test_empty_data_returns_zero(self):
+        from vllm_omni.entrypoints.openai.serving_duplex import _compute_pcm_duration_ms
+        duration = _compute_pcm_duration_ms(b"", 24000, "pcm_s16le")
+        assert duration == 0.0
+
+    def test_none_data_returns_zero(self):
+        from vllm_omni.entrypoints.openai.serving_duplex import _compute_pcm_duration_ms
+        duration = _compute_pcm_duration_ms(None, 24000, "pcm_s16le")
+        assert duration == 0.0
+
+
+# =============================================================================
+# Phase 2 Pre-Phase-3 Fixes: Chunk processor returns plain bool
+# =============================================================================
+
+
+class TestChunkProcessorReturnTypes:
+    """Test that chunk processor returns consistent Python types."""
+
+    def test_finished_is_plain_bool(self):
+        """Verify 'finished' field is a plain Python bool, not torch.Tensor."""
+        from collections import defaultdict
+        from unittest.mock import Mock
+
+        from vllm_omni.model_executor.stage_input_processors.moshi_streaming import (
+            MOSHI_NUM_CODEBOOKS,
+            dialogue_to_mimi_async_chunk,
+        )
+
+        connector = Mock()
+        connector.code_prompt_token_ids = defaultdict(list)
+        connector.put_requests = defaultdict(int)
+
+        request = Mock()
+        request.external_req_id = "req1"
+        request.is_finished.return_value = True
+
+        result = dialogue_to_mimi_async_chunk(
+            connector,
+            {"audio_codes": [0] * MOSHI_NUM_CODEBOOKS},
+            request,
+        )
+        assert result is not None
+        assert isinstance(result["finished"], bool)
+        assert result["finished"] is True
+
+    def test_code_predictor_codes_is_list(self):
+        """Verify 'code_predictor_codes' is a plain Python list."""
+        from collections import defaultdict
+        from unittest.mock import Mock
+
+        from vllm_omni.model_executor.stage_input_processors.moshi_streaming import (
+            MOSHI_NUM_CODEBOOKS,
+            dialogue_to_mimi_async_chunk,
+        )
+
+        connector = Mock()
+        connector.code_prompt_token_ids = defaultdict(list)
+        connector.put_requests = defaultdict(int)
+
+        request = Mock()
+        request.external_req_id = "req1"
+        request.is_finished.return_value = True
+
+        result = dialogue_to_mimi_async_chunk(
+            connector,
+            {"audio_codes": [0] * MOSHI_NUM_CODEBOOKS},
+            request,
+        )
+        assert isinstance(result["code_predictor_codes"], list)
+        assert all(isinstance(c, int) for c in result["code_predictor_codes"])

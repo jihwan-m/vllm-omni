@@ -839,7 +839,17 @@ async def audio_duplex(websocket: WebSocket):
         return
 
     handler = MoshiDuplexHandler(engine_client=engine_client)
-    await handler.handle(websocket)
+    try:
+        await handler.handle(websocket)
+    except Exception:
+        # handler.handle() has its own error handling with ErrorMessage;
+        # this is a safety net for truly unexpected failures.
+        import logging
+        logging.getLogger(__name__).exception("Unhandled error in duplex handler")
+        try:
+            await websocket.close(code=1011, reason="Internal server error")
+        except Exception:
+            pass
 
 
 # Health and Model endpoints for diffusion mode

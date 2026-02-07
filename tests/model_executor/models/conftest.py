@@ -209,6 +209,12 @@ if not _vllm_available:
     # vllm.platforms
     _register_mod("vllm.platforms", {"current_platform": MagicMock()})
 
+    # vllm.utils
+    _register_mod(
+        "vllm.utils",
+        {"random_uuid": lambda: "mock-uuid-1234"},
+    )
+
     # vllm.transformers_utils hierarchy
     _register_pkg("vllm.transformers_utils")
     _register_mod(

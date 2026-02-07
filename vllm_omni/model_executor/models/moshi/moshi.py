@@ -700,27 +700,49 @@ class MoshiForConditionalGenerationVLLM(nn.Module, SupportsPP):
 
     # ==================== Per-Step State (Streaming) ====================
 
-    def init_streaming_state(self, device: torch.device | None = None):
+    def init_streaming_state(
+        self,
+        request_id: str = "_default",
+        device: torch.device | None = None,
+    ):
         """Initialize persistent state for per-step streaming generation.
 
         Call this once before calling forward_dialogue_step() in a loop.
         The state tracks KV caches, previous tokens, and temporal position.
+
+        State is keyed by request_id so multiple concurrent requests can
+        each maintain independent streaming state on the same model instance.
+
+        Args:
+            request_id: Unique request identifier for state isolation.
+            device: Device to place tensors on. Defaults to model device.
         """
         if device is None:
             device = next(self.parameters()).device
 
-        self._streaming_state = {
+        if not hasattr(self, "_streaming_states"):
+            self._streaming_states: dict[str, dict] = {}
+
+        self._streaming_states[request_id] = {
             "past_key_values": None,
             "prev_text_token": None,
             "prev_audio_codes": None,
             "temporal_step": 0,
             "device": device,
         }
-        logger.debug("Initialized Moshi streaming state on %s", device)
+        logger.debug(
+            "Initialized Moshi streaming state for request %s on %s",
+            request_id, device,
+        )
 
-    def clear_streaming_state(self):
-        """Clear streaming state and free KV cache memory."""
-        self._streaming_state = None
+    def clear_streaming_state(self, request_id: str = "_default"):
+        """Clear streaming state and free KV cache memory for a request.
+
+        Args:
+            request_id: The request whose state to clear.
+        """
+        if hasattr(self, "_streaming_states") and request_id in self._streaming_states:
+            del self._streaming_states[request_id]
 
     @torch.inference_mode()
     def forward_dialogue_step(
@@ -728,17 +750,20 @@ class MoshiForConditionalGenerationVLLM(nn.Module, SupportsPP):
         user_audio_codes: list[int] | None = None,
         temperature: float = 0.7,
         top_k: int = 50,
+        request_id: str = "_default",
     ) -> dict:
         """Run a single temporal + depth step for streaming generation.
 
         This method is called once per temporal position (80ms frame).
-        It maintains internal state (KV cache, previous tokens) across calls.
+        It maintains internal state (KV cache, previous tokens) across calls,
+        keyed by request_id for concurrent request isolation.
 
         Args:
             user_audio_codes: User's audio codes for this step [num_codebooks].
                               None or empty uses silence padding.
             temperature: Sampling temperature.
             top_k: Top-k sampling parameter.
+            request_id: Unique request identifier for state lookup.
 
         Returns:
             Dict with:
@@ -746,11 +771,13 @@ class MoshiForConditionalGenerationVLLM(nn.Module, SupportsPP):
                 "text_token": int (sampled text token)
                 "temporal_step": int (current temporal position)
         """
-        state = self._streaming_state
-        if state is None:
+        states = getattr(self, "_streaming_states", None)
+        if states is None or request_id not in states:
             raise RuntimeError(
-                "Streaming state not initialized. Call init_streaming_state() first."
+                f"Streaming state not initialized for request '{request_id}'. "
+                "Call init_streaming_state(request_id=...) first."
             )
+        state = states[request_id]
 
         device = state["device"]
         t = state["temporal_step"]

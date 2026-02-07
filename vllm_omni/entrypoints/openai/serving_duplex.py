@@ -13,13 +13,11 @@ Protocol:
 """
 import asyncio
 import json
-import struct
 
 from vllm.logger import init_logger
 from vllm.utils import random_uuid
 
 from vllm_omni.entrypoints.openai.protocol.duplex import (
-    AudioInputDoneMessage,
     AudioOutputMeta,
     DuplexMessageType,
     ErrorMessage,
@@ -30,6 +28,14 @@ from vllm_omni.entrypoints.openai.protocol.duplex import (
 from vllm_omni.outputs import OmniStreamingChunk
 
 logger = init_logger(__name__)
+
+# Timeout for waiting on pipeline chunks (seconds).
+# Prevents indefinite blocking if pipeline hangs.
+_CHUNK_RECV_TIMEOUT = 60.0
+
+# Maximum number of chunks that can be buffered in the async queue
+# before the pipeline thread blocks (backpressure).
+_MAX_CHUNK_QUEUE_SIZE = 64
 
 
 class MoshiDuplexHandler:
@@ -214,10 +220,10 @@ class MoshiDuplexHandler:
                 # Send binary audio frame
                 await websocket.send_bytes(chunk.audio_data)
 
-                # Send metadata for the audio frame
-                duration_ms = len(chunk.audio_data) / (
-                    config.sample_rate * 2  # 16-bit = 2 bytes per sample
-                ) * 1000 if chunk.audio_data else 0
+                # Compute duration based on output audio format
+                duration_ms = _compute_pcm_duration_ms(
+                    chunk.audio_data, config.sample_rate, config.output_format,
+                )
                 total_duration_ms += duration_ms
 
                 await websocket.send_json(
@@ -257,8 +263,13 @@ class MoshiDuplexHandler:
 
         loop = asyncio.get_event_loop()
 
-        # Create a queue for cross-thread chunk delivery
-        chunk_queue = asyncio.Queue()
+        # Bounded queue for cross-thread chunk delivery (backpressure)
+        chunk_queue: asyncio.Queue = asyncio.Queue(
+            maxsize=_MAX_CHUNK_QUEUE_SIZE,
+        )
+
+        # Event to signal cancellation to the pipeline thread
+        cancel_event = asyncio.Event()
 
         def _run_pipeline():
             """Run in thread: execute pipeline, push chunks to queue."""
@@ -270,6 +281,11 @@ class MoshiDuplexHandler:
                     top_k=config.top_k,
                     max_duration_s=config.max_duration_s,
                 ):
+                    if cancel_event.is_set():
+                        logger.info(
+                            "Duplex session %s: pipeline cancelled", session_id,
+                        )
+                        break
                     loop.call_soon_threadsafe(chunk_queue.put_nowait, chunk)
                 # Signal completion
                 loop.call_soon_threadsafe(chunk_queue.put_nowait, None)
@@ -284,19 +300,33 @@ class MoshiDuplexHandler:
                 )
 
         # Start pipeline in background thread
-        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-        executor.submit(_run_pipeline)
+        executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix=f"moshi-pipeline-{session_id[:8]}",
+        )
+        future = executor.submit(_run_pipeline)
 
         try:
             while True:
-                chunk = await chunk_queue.get()
+                try:
+                    chunk = await asyncio.wait_for(
+                        chunk_queue.get(), timeout=_CHUNK_RECV_TIMEOUT,
+                    )
+                except asyncio.TimeoutError:
+                    logger.error(
+                        "Duplex session %s: timeout waiting for pipeline chunk",
+                        session_id,
+                    )
+                    raise RuntimeError("Pipeline timeout: no chunk received")
                 if chunk is None:
                     break
                 if chunk.error:
                     raise RuntimeError(f"Pipeline error: {chunk.error}")
                 yield chunk
         finally:
-            executor.shutdown(wait=False)
+            # Signal cancellation and wait for the thread to finish
+            cancel_event.set()
+            executor.shutdown(wait=True, cancel_futures=True)
 
     @staticmethod
     def _pcm_to_token_ids(
@@ -307,9 +337,11 @@ class MoshiDuplexHandler:
         """Convert raw PCM audio bytes to mock token IDs.
 
         In the full implementation, this would run the Mimi encoder
-        to convert audio waveform → RVQ codes → flattened token IDs.
-        For Phase 2, we pass the raw audio length as a placeholder
-        and let the pipeline handle encoding.
+        to convert audio waveform -> RVQ codes -> flattened token IDs.
+        For Phase 2, we compute the frame count from input duration
+        and return placeholder token IDs (silence).
+
+        TODO(Phase 3): Replace with actual Mimi encoder integration.
         """
         if audio_format == "pcm_s16le":
             # 16-bit signed LE: 2 bytes per sample
@@ -329,3 +361,37 @@ class MoshiDuplexHandler:
         # Return placeholder token IDs (zeros = silence)
         # In production, Mimi encoder would fill these with real RVQ codes
         return [0] * (num_frames * num_codebooks)
+
+
+def _compute_pcm_duration_ms(
+    audio_data: bytes,
+    sample_rate: int,
+    output_format: str,
+) -> float:
+    """Compute duration in milliseconds for an audio data chunk.
+
+    For uncompressed PCM formats, duration can be computed exactly from
+    byte length. For compressed formats (opus), duration cannot be
+    determined from byte length alone, so we return 0.0.
+
+    Args:
+        audio_data: Raw audio bytes.
+        sample_rate: Sample rate in Hz.
+        output_format: Audio format identifier.
+
+    Returns:
+        Duration in milliseconds, or 0.0 if format is compressed.
+    """
+    if not audio_data:
+        return 0.0
+
+    if output_format == "pcm_s16le":
+        bytes_per_sample = 2
+    elif output_format == "pcm_f32le":
+        bytes_per_sample = 4
+    else:
+        # Compressed formats (opus, etc.): byte length != duration
+        return 0.0
+
+    num_samples = len(audio_data) / bytes_per_sample
+    return (num_samples / sample_rate) * 1000
