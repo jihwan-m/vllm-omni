@@ -68,6 +68,41 @@ if not _vllm_available:
 
         pass
 
+    class _ColumnParallelLinear(nn.Module):
+        """Stub for vllm.model_executor.layers.linear.ColumnParallelLinear.
+
+        Wraps nn.Linear but returns (output, bias) tuples like vLLM's
+        parallel layers. Accepts and ignores quant_config/prefix kwargs.
+        """
+
+        def __init__(self, input_size, output_size, bias=True, **kwargs):
+            super().__init__()
+            self._linear = nn.Linear(input_size, output_size, bias=bias)
+            # Expose .weight (and .bias) at the top level so
+            # named_parameters() matches HF checkpoint paths.
+            self.weight = self._linear.weight
+            if bias:
+                self.bias = self._linear.bias
+
+        def forward(self, x):
+            return self._linear(x), None
+
+    class _RowParallelLinear(nn.Module):
+        """Stub for vllm.model_executor.layers.linear.RowParallelLinear.
+
+        Same contract as _ColumnParallelLinear.
+        """
+
+        def __init__(self, input_size, output_size, bias=True, **kwargs):
+            super().__init__()
+            self._linear = nn.Linear(input_size, output_size, bias=bias)
+            self.weight = self._linear.weight
+            if bias:
+                self.bias = self._linear.bias
+
+        def forward(self, x):
+            return self._linear(x), None
+
     class _SupportsPP:
         """Stub for vllm.model_executor.models.interfaces.SupportsPP."""
 
@@ -149,7 +184,11 @@ if not _vllm_available:
     _register_pkg("vllm.model_executor.layers")
     _register_mod(
         "vllm.model_executor.layers.linear",
-        {"UnquantizedLinear": _UnquantizedLinear},
+        {
+            "UnquantizedLinear": _UnquantizedLinear,
+            "ColumnParallelLinear": _ColumnParallelLinear,
+            "RowParallelLinear": _RowParallelLinear,
+        },
     )
     _register_pkg("vllm.model_executor.models")
     _register_mod(

@@ -22,7 +22,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
-from vllm.model_executor.layers.linear import UnquantizedLinear
+from vllm.model_executor.layers.linear import (
+    ColumnParallelLinear,
+    RowParallelLinear,
+)
 from vllm.model_executor.models.interfaces import SupportsPP
 from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
 from vllm.sequence import IntermediateTensors
@@ -82,21 +85,36 @@ def apply_rotary_pos_emb(q, k, cos, sin):
 
 
 class MoshiGatingMLP(nn.Module):
-    """Gated MLP with SiLU activation. fc1 output is split in half for gating."""
+    """Gated MLP with SiLU activation. fc1 output is split in half for gating.
 
-    def __init__(self, hidden_size: int, ffn_dim: int):
+    Supports quantization (AWQ, GPTQ, etc.) via vLLM's parallel linear layers.
+    When quant_config is None, behaves identically to standard nn.Linear.
+    """
+
+    def __init__(self, hidden_size: int, ffn_dim: int,
+                 quant_config=None, prefix: str = ""):
         super().__init__()
-        self.fc1 = nn.Linear(hidden_size, ffn_dim, bias=False)
-        self.fc2 = nn.Linear(ffn_dim // 2, hidden_size, bias=False)
+        self.fc1 = ColumnParallelLinear(
+            hidden_size, ffn_dim, bias=False,
+            quant_config=quant_config, prefix=f"{prefix}.fc1",
+        )
+        self.fc2 = RowParallelLinear(
+            ffn_dim // 2, hidden_size, bias=False,
+            quant_config=quant_config, prefix=f"{prefix}.fc2",
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        gate_and_up = self.fc1(x)
+        gate_and_up, _ = self.fc1(x)
         gate, up = gate_and_up.chunk(2, dim=-1)
-        return self.fc2(F.silu(gate) * up)
+        out, _ = self.fc2(F.silu(gate) * up)
+        return out
 
 
 class MoshiAttention(nn.Module):
-    """Multi-head attention for Temporal Transformer (with RoPE)."""
+    """Multi-head attention for Temporal Transformer (with RoPE).
+
+    Supports quantization via vLLM's parallel linear layers.
+    """
 
     def __init__(
         self,
@@ -105,6 +123,8 @@ class MoshiAttention(nn.Module):
         num_kv_heads: int | None = None,
         head_dim: int | None = None,
         max_position_embeddings: int = 3000,
+        quant_config=None,
+        prefix: str = "",
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -113,15 +133,28 @@ class MoshiAttention(nn.Module):
         self.head_dim = head_dim or (hidden_size // num_heads)
 
         # HF Moshi wraps nn.Linear in MoshiLinear, creating .linear.weight
-        # We use a nested module to match the weight key path
+        # We use a nested module to match the weight key path.
+        # ColumnParallelLinear/RowParallelLinear enable quantization support.
         self.q_proj = nn.Module()
-        self.q_proj.linear = nn.Linear(hidden_size, self.num_heads * self.head_dim, bias=False)
+        self.q_proj.linear = ColumnParallelLinear(
+            hidden_size, self.num_heads * self.head_dim, bias=False,
+            quant_config=quant_config, prefix=f"{prefix}.q_proj.linear",
+        )
         self.k_proj = nn.Module()
-        self.k_proj.linear = nn.Linear(hidden_size, self.num_kv_heads * self.head_dim, bias=False)
+        self.k_proj.linear = ColumnParallelLinear(
+            hidden_size, self.num_kv_heads * self.head_dim, bias=False,
+            quant_config=quant_config, prefix=f"{prefix}.k_proj.linear",
+        )
         self.v_proj = nn.Module()
-        self.v_proj.linear = nn.Linear(hidden_size, self.num_kv_heads * self.head_dim, bias=False)
+        self.v_proj.linear = ColumnParallelLinear(
+            hidden_size, self.num_kv_heads * self.head_dim, bias=False,
+            quant_config=quant_config, prefix=f"{prefix}.v_proj.linear",
+        )
         self.o_proj = nn.Module()
-        self.o_proj.linear = nn.Linear(self.num_heads * self.head_dim, hidden_size, bias=False)
+        self.o_proj.linear = RowParallelLinear(
+            self.num_heads * self.head_dim, hidden_size, bias=False,
+            quant_config=quant_config, prefix=f"{prefix}.o_proj.linear",
+        )
 
         self.rotary_emb = MoshiRotaryEmbedding(self.head_dim, max_position_embeddings)
 
@@ -134,9 +167,12 @@ class MoshiAttention(nn.Module):
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None]:
         bsz, seq_len, _ = hidden_states.shape
 
-        q = self.q_proj.linear(hidden_states).view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        k = self.k_proj.linear(hidden_states).view(bsz, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        v = self.v_proj.linear(hidden_states).view(bsz, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        q, _ = self.q_proj.linear(hidden_states)
+        q = q.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        k, _ = self.k_proj.linear(hidden_states)
+        k = k.view(bsz, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        v, _ = self.v_proj.linear(hidden_states)
+        v = v.view(bsz, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
 
         cos, sin = self.rotary_emb(q, position_ids)
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
@@ -156,7 +192,7 @@ class MoshiAttention(nn.Module):
         # Scaled dot-product attention
         attn_output = F.scaled_dot_product_attention(q, k, v, is_causal=(past_key_value is None and seq_len > 1))
         attn_output = attn_output.transpose(1, 2).contiguous().view(bsz, seq_len, -1)
-        attn_output = self.o_proj.linear(attn_output)
+        attn_output, _ = self.o_proj.linear(attn_output)
 
         return attn_output, new_kv
 
@@ -173,6 +209,8 @@ class MoshiDecoderLayer(nn.Module):
         head_dim: int | None = None,
         rms_norm_eps: float = 1e-8,
         max_position_embeddings: int = 3000,
+        quant_config=None,
+        prefix: str = "",
     ):
         super().__init__()
         self.self_attn = MoshiAttention(
@@ -181,8 +219,13 @@ class MoshiDecoderLayer(nn.Module):
             num_kv_heads=num_kv_heads,
             head_dim=head_dim,
             max_position_embeddings=max_position_embeddings,
+            quant_config=quant_config,
+            prefix=f"{prefix}.self_attn",
         )
-        self.mlp = MoshiGatingMLP(hidden_size, ffn_dim)
+        self.mlp = MoshiGatingMLP(
+            hidden_size, ffn_dim,
+            quant_config=quant_config, prefix=f"{prefix}.mlp",
+        )
         self.input_layernorm = MoshiRMSNorm(hidden_size, rms_norm_eps)
         self.post_attention_layernorm = MoshiRMSNorm(hidden_size, rms_norm_eps)
 
@@ -228,6 +271,8 @@ class MoshiTemporalModel(nn.Module):
         head_dim: int | None = None,
         rms_norm_eps: float = 1e-8,
         max_position_embeddings: int = 3000,
+        quant_config=None,
+        prefix: str = "",
     ):
         super().__init__()
         self.embed_tokens = nn.Embedding(vocab_size + 1, hidden_size)
@@ -240,8 +285,10 @@ class MoshiTemporalModel(nn.Module):
                 head_dim=head_dim,
                 rms_norm_eps=rms_norm_eps,
                 max_position_embeddings=max_position_embeddings,
+                quant_config=quant_config,
+                prefix=f"{prefix}.layers.{i}",
             )
-            for _ in range(num_hidden_layers)
+            for i in range(num_hidden_layers)
         ])
         self.norm = MoshiRMSNorm(hidden_size, rms_norm_eps)
 
@@ -271,7 +318,7 @@ class MoshiTemporalDecoder(nn.Module):
     Weight path: decoder.*
     """
 
-    def __init__(self, config):
+    def __init__(self, config, quant_config=None, prefix: str = ""):
         super().__init__()
         self.model = MoshiTemporalModel(
             vocab_size=config.vocab_size,
@@ -283,8 +330,13 @@ class MoshiTemporalDecoder(nn.Module):
             head_dim=getattr(config, "head_dim", None),
             rms_norm_eps=config.rms_norm_eps,
             max_position_embeddings=config.max_position_embeddings,
+            quant_config=quant_config,
+            prefix=f"{prefix}.model",
         )
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.lm_head = ColumnParallelLinear(
+            config.hidden_size, config.vocab_size, bias=False,
+            quant_config=quant_config, prefix=f"{prefix}.lm_head",
+        )
 
 
 # =============================================================================
@@ -606,6 +658,7 @@ class MoshiForConditionalGenerationVLLM(nn.Module, SupportsPP):
         self.vllm_config = vllm_config
         self.config = vllm_config.model_config.hf_config
         self.model_stage = vllm_config.model_config.model_stage
+        self.quant_config = getattr(vllm_config, "quant_config", None)
         self.have_multimodal_outputs = True
 
         if self.model_stage == "dialogue":
@@ -636,7 +689,9 @@ class MoshiForConditionalGenerationVLLM(nn.Module, SupportsPP):
 
         # Temporal decoder (backbone LLM + text LM head)
         # Weight path: decoder.*
-        self.decoder = MoshiTemporalDecoder(config)
+        self.decoder = MoshiTemporalDecoder(
+            config, quant_config=self.quant_config, prefix="decoder",
+        )
 
         # Depth decoder (codebook generation)
         # Weight path: depth_decoder.*
@@ -832,7 +887,7 @@ class MoshiForConditionalGenerationVLLM(nn.Module, SupportsPP):
         temporal_context = hidden_states[:, -1, :]
 
         # --- Sample text token ---
-        text_logits = self.decoder.lm_head(temporal_context)
+        text_logits, _ = self.decoder.lm_head(temporal_context)
         text_token = self._sample_token(text_logits, temperature=temperature, top_k=top_k)
 
         # --- Depth Transformer: generate 8 audio codes ---
@@ -960,7 +1015,7 @@ class MoshiForConditionalGenerationVLLM(nn.Module, SupportsPP):
             temporal_context = hidden_states[:, -1, :]  # [1, H]
 
             # --- Sample text token ---
-            text_logits = self.decoder.lm_head(temporal_context)  # [1, vocab_size]
+            text_logits, _ = self.decoder.lm_head(temporal_context)  # [1, vocab_size]
             text_token = self._sample_token(text_logits, temperature=0.7, top_k=50)
             text_tokens.append(text_token)
 
@@ -1061,7 +1116,11 @@ class MoshiForConditionalGenerationVLLM(nn.Module, SupportsPP):
         return loaded
 
     def _load_dialogue_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        """Load weights for dialogue stage (temporal + depth + audio embeddings)."""
+        """Load weights for dialogue stage (temporal + depth + audio embeddings).
+
+        Uses vLLM's weight_loader mechanism for quantization-aware layers.
+        Standard (non-quantized) parameters fall back to direct copy.
+        """
         loaded = set()
         params_dict = dict(self.named_parameters())
 
@@ -1073,7 +1132,12 @@ class MoshiForConditionalGenerationVLLM(nn.Module, SupportsPP):
             # Map to our parameter names (already matching HF format)
             if name in params_dict:
                 param = params_dict[name]
-                if param.shape == tensor.shape:
+                # Quantization-aware layers attach a weight_loader to params
+                weight_loader = getattr(param, "weight_loader", None)
+                if weight_loader is not None:
+                    weight_loader(param, tensor)
+                    loaded.add(name)
+                elif param.shape == tensor.shape:
                     param.data.copy_(tensor)
                     loaded.add(name)
                 else:
@@ -1081,9 +1145,6 @@ class MoshiForConditionalGenerationVLLM(nn.Module, SupportsPP):
                         f"Shape mismatch for {name}: "
                         f"expected {param.shape}, got {tensor.shape}"
                     )
-            else:
-                # Try without common prefixes for debugging
-                pass
 
         logger.info(f"Loaded {len(loaded)} dialogue weights")
         return loaded

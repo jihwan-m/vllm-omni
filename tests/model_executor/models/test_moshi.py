@@ -405,15 +405,17 @@ class TestMoshiTemporalDecoder:
 
         assert hasattr(decoder, "model")
         assert hasattr(decoder, "lm_head")
-        assert decoder.lm_head.out_features == config.vocab_size
+        # lm_head is now ColumnParallelLinear: check weight shape
+        assert decoder.lm_head.weight.shape[0] == config.vocab_size
 
     def test_lm_head_shape(self, device):
         config = FakeMoshiConfig()
         decoder = MoshiTemporalDecoder(config).to(device)
 
         hidden = torch.randn(1, 5, config.hidden_size, device=device)
-        logits = decoder.lm_head(hidden)
+        logits, bias = decoder.lm_head(hidden)
         assert logits.shape == (1, 5, config.vocab_size)
+        assert bias is None  # no bias
 
 
 # =============================================================================
@@ -695,8 +697,8 @@ class TestDialogueInferenceLoop:
                 combined, pos, past_key_values=past_key_values, use_cache=True,
             )
 
-            # Text sampling
-            logits = decoder.lm_head(hidden[:, -1, :])
+            # Text sampling (lm_head returns (logits, bias) tuple)
+            logits, _ = decoder.lm_head(hidden[:, -1, :])
             text_token = torch.argmax(logits, dim=-1).item()
             text_tokens.append(text_token)
 
@@ -1814,3 +1816,176 @@ class TestDuplexProtocolPhase3:
     def test_message_type_has_interrupt(self):
         from vllm_omni.entrypoints.openai.protocol.duplex import DuplexMessageType
         assert DuplexMessageType.INTERRUPT == "interrupt"
+
+
+# =============================================================================
+# Test Quantization Support
+# =============================================================================
+
+
+class TestQuantizationSupport:
+    """Tests that temporal transformer layers accept and propagate quant_config."""
+
+    def test_gating_mlp_accepts_quant_config(self, hidden_size, ffn_dim, device):
+        """MoshiGatingMLP accepts quant_config and prefix kwargs."""
+        mlp = MoshiGatingMLP(
+            hidden_size, ffn_dim, quant_config=None, prefix="test.mlp",
+        ).to(device)
+        x = torch.randn(1, 3, hidden_size, device=device)
+        out = mlp(x)
+        assert out.shape == (1, 3, hidden_size)
+
+    def test_attention_accepts_quant_config(self, hidden_size, num_heads, device):
+        """MoshiAttention accepts quant_config and prefix kwargs."""
+        attn = MoshiAttention(
+            hidden_size, num_heads,
+            quant_config=None, prefix="test.attn",
+        ).to(device)
+        x = torch.randn(1, 3, hidden_size, device=device)
+        pos = torch.arange(3, device=device).unsqueeze(0)
+        out, kv = attn(x, pos, use_cache=True)
+        assert out.shape == (1, 3, hidden_size)
+        assert kv is not None
+
+    def test_decoder_layer_accepts_quant_config(self, hidden_size, num_heads, ffn_dim, device):
+        """MoshiDecoderLayer propagates quant_config to attention and MLP."""
+        layer = MoshiDecoderLayer(
+            hidden_size, num_heads, ffn_dim,
+            quant_config=None, prefix="layers.0",
+        ).to(device)
+        x = torch.randn(1, 3, hidden_size, device=device)
+        pos = torch.arange(3, device=device).unsqueeze(0)
+        out, _ = layer(x, pos)
+        assert out.shape == (1, 3, hidden_size)
+
+    def test_temporal_model_accepts_quant_config(self, device):
+        """MoshiTemporalModel propagates quant_config to all layers."""
+        config = FakeMoshiConfig()
+        model = MoshiTemporalModel(
+            vocab_size=config.vocab_size,
+            hidden_size=config.hidden_size,
+            num_hidden_layers=config.num_hidden_layers,
+            num_attention_heads=config.num_attention_heads,
+            ffn_dim=config.ffn_dim,
+            rms_norm_eps=config.rms_norm_eps,
+            quant_config=None,
+            prefix="decoder.model",
+        ).to(device)
+
+        inputs_embeds = torch.randn(1, 3, config.hidden_size, device=device)
+        pos = torch.arange(3, device=device).unsqueeze(0)
+        out, kvs = model(inputs_embeds, pos, use_cache=True)
+        assert out.shape == (1, 3, config.hidden_size)
+        assert len(kvs) == config.num_hidden_layers
+
+    def test_temporal_decoder_accepts_quant_config(self, device):
+        """MoshiTemporalDecoder propagates quant_config throughout."""
+        config = FakeMoshiConfig()
+        decoder = MoshiTemporalDecoder(
+            config, quant_config=None, prefix="decoder",
+        ).to(device)
+
+        hidden = torch.randn(1, 3, config.hidden_size, device=device)
+        logits, bias = decoder.lm_head(hidden)
+        assert logits.shape == (1, 3, config.vocab_size)
+        assert bias is None
+
+    def test_parallel_linear_layers_return_tuples(self, hidden_size, num_heads, device):
+        """All temporal projection layers return (output, bias) tuples."""
+        attn = MoshiAttention(hidden_size, num_heads).to(device)
+        x = torch.randn(1, 1, hidden_size, device=device)
+        # Each projection should return a tuple
+        q_out = attn.q_proj.linear(x)
+        assert isinstance(q_out, tuple) and len(q_out) == 2
+        k_out = attn.k_proj.linear(x)
+        assert isinstance(k_out, tuple) and len(k_out) == 2
+        v_out = attn.v_proj.linear(x)
+        assert isinstance(v_out, tuple) and len(v_out) == 2
+        o_in = torch.randn(1, 1, num_heads * (hidden_size // num_heads), device=device)
+        o_out = attn.o_proj.linear(o_in)
+        assert isinstance(o_out, tuple) and len(o_out) == 2
+
+    def test_mlp_parallel_linear_layers(self, hidden_size, ffn_dim, device):
+        """MLP fc1 and fc2 are now parallel linear layers returning tuples."""
+        mlp = MoshiGatingMLP(hidden_size, ffn_dim).to(device)
+        x = torch.randn(1, 1, hidden_size, device=device)
+        fc1_out = mlp.fc1(x)
+        assert isinstance(fc1_out, tuple) and len(fc1_out) == 2
+        assert fc1_out[0].shape == (1, 1, ffn_dim)
+        assert fc1_out[1] is None  # no bias
+
+    def test_depth_transformer_unchanged(self, device):
+        """Depth transformer still uses MoshiFlexibleLinear (not quantized)."""
+        depth_config = FakeDepthConfig()
+        depth = MoshiDepthDecoder(depth_config).to(device)
+        # Depth attention uses MoshiFlexibleLinear, not parallel layers
+        layer = depth.layers[0]
+        assert isinstance(layer.self_attn.q_proj.linear, MoshiFlexibleLinear)
+        assert isinstance(layer.mlp.fc1, MoshiFlexibleLinear)
+
+    def test_weight_loading_with_weight_loader(self, device):
+        """Weight loading uses weight_loader attribute when present."""
+        from vllm_omni.model_executor.models.moshi.moshi import (
+            MoshiForConditionalGenerationVLLM,
+        )
+
+        # Build a minimal vllm_config mock
+        config = FakeMoshiConfig()
+        config.depth_decoder_config = FakeDepthConfig()
+
+        class FakeModelConfig:
+            hf_config = config
+            model_stage = "dialogue"
+            def get_hidden_size(self):
+                return config.hidden_size
+
+        class FakeVllmConfig:
+            model_config = FakeModelConfig()
+            quant_config = None
+
+        model = MoshiForConditionalGenerationVLLM(
+            vllm_config=FakeVllmConfig(), prefix="",
+        )
+
+        # Collect all named parameters
+        params = dict(model.named_parameters())
+        # Verify we have temporal decoder params
+        temporal_keys = [k for k in params if k.startswith("decoder.")]
+        assert len(temporal_keys) > 0
+
+        # Simulate weight loading with a fake weight_loader
+        loaded_via_loader = []
+        test_param_name = temporal_keys[0]
+        param = params[test_param_name]
+        # Attach a custom weight_loader
+        param.weight_loader = lambda p, t: loaded_via_loader.append(test_param_name)
+
+        weights = [(test_param_name, torch.randn_like(param.data))]
+        model._load_dialogue_weights(iter(weights))
+        assert test_param_name in loaded_via_loader
+
+    def test_quant_config_stored_on_model(self):
+        """Model stores quant_config from vllm_config."""
+        from vllm_omni.model_executor.models.moshi.moshi import (
+            MoshiForConditionalGenerationVLLM,
+        )
+
+        config = FakeMoshiConfig()
+        config.depth_decoder_config = FakeDepthConfig()
+
+        class FakeModelConfig:
+            hf_config = config
+            model_stage = "dialogue"
+            def get_hidden_size(self):
+                return config.hidden_size
+
+        sentinel = object()
+
+        class FakeVllmConfig:
+            model_config = FakeModelConfig()
+            quant_config = sentinel
+
+        model = MoshiForConditionalGenerationVLLM(
+            vllm_config=FakeVllmConfig(), prefix="",
+        )
+        assert model.quant_config is sentinel

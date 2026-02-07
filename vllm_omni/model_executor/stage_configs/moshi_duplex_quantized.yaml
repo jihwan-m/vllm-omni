@@ -1,0 +1,78 @@
+# Stage config for Moshi full-duplex with INT4 quantization.
+#
+# Optimized for consumer GPUs with limited VRAM (e.g., RTX 4070 Ti Super
+# with 16 GB, RTX 4090 with 24 GB). Uses AWQ/GPTQ 4-bit quantization
+# to reduce model weights from ~14 GB (FP16) to ~3.5 GB (INT4).
+#
+# To use this config:
+#   1. Quantize the model checkpoint (see below)
+#   2. Serve with: vllm serve <quantized-model-path> --omni \
+#        --stage-configs-path moshi_duplex_quantized.yaml \
+#        --quantization awq   # or gptq
+#
+# Quantizing the checkpoint with AutoAWQ:
+#   from awq import AutoAWQForCausalLM
+#   model = AutoAWQForCausalLM.from_pretrained("kmhf/hf-moshiko")
+#   model.quantize(tokenizer=None, quant_config={"w_bit": 4, "q_group_size": 128})
+#   model.save_quantized("kmhf/hf-moshiko-awq")
+#
+# Model: kmhf/hf-moshiko (HuggingFace Transformers format)
+# Reference: https://arxiv.org/abs/2410.00037
+# Hardware: 1x GPU with 16+ GB VRAM
+
+duplex: true
+async_chunk: false
+
+stage_args:
+  # ===== STAGE 0: Moshi Dialogue (Duplex, Quantized) =====
+  # The temporal transformer (7B) is quantized to 4-bit.
+  # The depth transformer (small, 6L) stays in FP16 — its 3D
+  # per-codebook weights (MoshiFlexibleLinear) are not quantized.
+  - stage_id: 0
+    stage_type: llm
+    runtime:
+      devices: "0"
+      max_batch_size: 1
+    engine_args:
+      model_stage: dialogue
+      model_arch: MoshiForConditionalGenerationVLLM
+      worker_type: generation
+      scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
+      # Higher utilization is safe with quantized weights
+      gpu_memory_utilization: 0.95
+      enforce_eager: true
+      trust_remote_code: true
+      engine_output_type: latent
+      enable_prefix_caching: false
+      distributed_executor_backend: "mp"
+      max_num_batched_tokens: 65536
+      tensor_parallel_size: 1
+      # Quantization method — set via CLI --quantization flag
+      # Supported: awq, gptq, bitsandbytes, fp8
+    final_output: true
+    final_output_type: audio
+    is_comprehension: true
+    default_sampling_params:
+      temperature: 0.7
+      top_k: 50
+      max_tokens: 16384
+      seed: 42
+      detokenize: false
+
+# Duplex configuration — tuned for 16 GB VRAM
+duplex_config:
+  # Shorter conversations to keep KV cache small
+  max_duration_s: 120
+
+  # Smaller ring buffer (128 frames = ~10 seconds)
+  ring_buffer_capacity: 128
+
+  # Smaller output queue (64 frames = ~5 seconds)
+  output_queue_size: 64
+
+  num_codebooks: 8
+
+  # Lower KV cache limit to reduce peak VRAM
+  max_temporal_steps: 1500
+
+  session_timeout_s: 300
