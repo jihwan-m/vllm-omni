@@ -228,6 +228,30 @@ if not _vllm_available:
         "vllm.transformers_utils.utils", {"maybe_model_redirect": MagicMock()}
     )
 
+    # vllm.outputs and vllm.v1.outputs
+    _register_mod(
+        "vllm.outputs",
+        {"RequestOutput": type("RequestOutput", (), {})},
+    )
+    _register_mod(
+        "vllm.v1.outputs",
+        {"ModelRunnerOutput": type("ModelRunnerOutput", (), {})},
+    )
+    _register_pkg("vllm.v1.core")
+    _register_pkg("vllm.v1.core.sched")
+    _register_mod(
+        "vllm.v1.core.sched.output",
+        {"SchedulerOutput": type("SchedulerOutput", (), {})},
+    )
+    _register_pkg("vllm.v1.request")
+    _register_mod(
+        "vllm.v1.request",
+        {
+            "Request": type("Request", (), {}),
+            "RequestStatus": type("RequestStatus", (), {"FINISHED_STOPPED": 0}),
+        },
+    )
+
     # ===========================================================
     # Pre-register vllm_omni packages to bypass __init__.py chains
     # that have deep vllm dependencies (config, entrypoints, etc.)
@@ -240,4 +264,19 @@ if not _vllm_available:
     _register_pkg(
         "vllm_omni.model_executor.models",
         os.path.join(_VLLM_OMNI_DIR, "model_executor", "models"),
+    )
+
+    # Pre-register entrypoints hierarchy to bypass __init__.py
+    # chains that import AsyncOmni, api_server, etc.
+    _register_pkg(
+        "vllm_omni.entrypoints",
+        os.path.join(_VLLM_OMNI_DIR, "entrypoints"),
+    )
+    _register_pkg(
+        "vllm_omni.entrypoints.openai",
+        os.path.join(_VLLM_OMNI_DIR, "entrypoints", "openai"),
+    )
+    _register_pkg(
+        "vllm_omni.entrypoints.openai.protocol",
+        os.path.join(_VLLM_OMNI_DIR, "entrypoints", "openai", "protocol"),
     )

@@ -19,7 +19,7 @@ from typing import Annotated, Any, cast
 
 import httpx
 import vllm.envs as envs
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile, WebSocket
 from fastapi.responses import JSONResponse, StreamingResponse
 from PIL import Image
 from starlette.datastructures import State
@@ -817,6 +817,29 @@ async def list_voices(raw_request: Request):
 
     speakers = sorted(handler.supported_speakers) if handler.supported_speakers else []
     return JSONResponse(content={"voices": speakers})
+
+
+# WebSocket endpoint for real-time audio streaming (Moshi duplex)
+@router.websocket("/v1/audio/duplex")
+async def audio_duplex(websocket: WebSocket):
+    """WebSocket endpoint for real-time Moshi audio streaming.
+
+    Protocol:
+      1. Client sends session.start (JSON) with audio config
+      2. Server sends session.created (JSON)
+      3. Client sends audio.input (binary) + audio.input.done (JSON)
+      4. Server streams audio.output (binary) + audio.output.meta (JSON)
+      5. Server sends generation.done (JSON)
+    """
+    from vllm_omni.entrypoints.openai.serving_duplex import MoshiDuplexHandler
+
+    engine_client = getattr(websocket.app.state, "engine_client", None)
+    if engine_client is None:
+        await websocket.close(code=1011, reason="Engine not available")
+        return
+
+    handler = MoshiDuplexHandler(engine_client=engine_client)
+    await handler.handle(websocket)
 
 
 # Health and Model endpoints for diffusion mode

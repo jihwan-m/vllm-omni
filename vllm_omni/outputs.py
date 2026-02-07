@@ -9,6 +9,32 @@ from vllm.v1.outputs import ModelRunnerOutput
 from vllm_omni.inputs.data import OmniPromptType
 
 
+@dataclass
+class OmniStreamingChunk:
+    """A partial audio chunk yielded during streaming generation.
+
+    Used by the streaming orchestrator to deliver incremental audio
+    data to the WebSocket handler before full generation completes.
+
+    Attributes:
+        stage_id: Stage that produced this chunk
+        chunk_index: Sequential chunk index within this request
+        audio_data: Raw audio bytes (PCM) for this chunk, or None
+        audio_codes: Raw audio codebook tokens before Mimi decoding
+        text_token: Text token generated at this step (if any)
+        is_final: Whether this is the last chunk
+        error: Error message if generation failed
+    """
+
+    stage_id: int = 0
+    chunk_index: int = 0
+    audio_data: bytes | None = None
+    audio_codes: list[int] | None = None
+    text_token: int | None = None
+    is_final: bool = False
+    error: str | None = None
+
+
 class OmniModelRunnerOutput(ModelRunnerOutput):
     """Model runner output for omni models.
 

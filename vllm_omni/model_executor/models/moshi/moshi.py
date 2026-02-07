@@ -698,6 +698,136 @@ class MoshiForConditionalGenerationVLLM(nn.Module, SupportsPP):
             multimodal_outputs={"model_outputs": model_outputs},
         )
 
+    # ==================== Per-Step State (Streaming) ====================
+
+    def init_streaming_state(self, device: torch.device | None = None):
+        """Initialize persistent state for per-step streaming generation.
+
+        Call this once before calling forward_dialogue_step() in a loop.
+        The state tracks KV caches, previous tokens, and temporal position.
+        """
+        if device is None:
+            device = next(self.parameters()).device
+
+        self._streaming_state = {
+            "past_key_values": None,
+            "prev_text_token": None,
+            "prev_audio_codes": None,
+            "temporal_step": 0,
+            "device": device,
+        }
+        logger.debug("Initialized Moshi streaming state on %s", device)
+
+    def clear_streaming_state(self):
+        """Clear streaming state and free KV cache memory."""
+        self._streaming_state = None
+
+    @torch.inference_mode()
+    def forward_dialogue_step(
+        self,
+        user_audio_codes: list[int] | None = None,
+        temperature: float = 0.7,
+        top_k: int = 50,
+    ) -> dict:
+        """Run a single temporal + depth step for streaming generation.
+
+        This method is called once per temporal position (80ms frame).
+        It maintains internal state (KV cache, previous tokens) across calls.
+
+        Args:
+            user_audio_codes: User's audio codes for this step [num_codebooks].
+                              None or empty uses silence padding.
+            temperature: Sampling temperature.
+            top_k: Top-k sampling parameter.
+
+        Returns:
+            Dict with:
+                "audio_codes": list[int] of length num_codebooks (8)
+                "text_token": int (sampled text token)
+                "temporal_step": int (current temporal position)
+        """
+        state = self._streaming_state
+        if state is None:
+            raise RuntimeError(
+                "Streaming state not initialized. Call init_streaming_state() first."
+            )
+
+        device = state["device"]
+        t = state["temporal_step"]
+        num_codebooks = self.num_codebooks
+
+        # --- Build input embeddings for time step t ---
+
+        # Text embedding (previous text token, or PAD for t=0)
+        if state["prev_text_token"] is None:
+            text_token_id = self.vocab_size  # PAD/BOS
+        else:
+            text_token_id = state["prev_text_token"]
+
+        text_embed = self.decoder.model.embed_tokens(
+            torch.tensor([[text_token_id]], device=device, dtype=torch.long)
+        )
+
+        # Audio embeddings: sum across all 16 streams
+        audio_embed = torch.zeros_like(text_embed)
+
+        # Moshi's own audio codes (streams 0-7): from previous step
+        for k in range(num_codebooks):
+            if state["prev_audio_codes"] is not None:
+                code_id = state["prev_audio_codes"][k]
+            else:
+                code_id = 0
+            audio_embed = audio_embed + self.embed_tokens[k](
+                torch.tensor([[code_id]], device=device, dtype=torch.long)
+            )
+
+        # User audio codes (streams 8-15): from input
+        if user_audio_codes is None:
+            user_audio_codes = [0] * num_codebooks
+        for k in range(num_codebooks):
+            user_code = user_audio_codes[k] if k < len(user_audio_codes) else 0
+            audio_embed = audio_embed + self.embed_tokens[num_codebooks + k](
+                torch.tensor([[user_code]], device=device, dtype=torch.long)
+            )
+
+        combined_embed = text_embed + audio_embed
+
+        # --- Temporal Transformer forward ---
+        position_ids = torch.tensor([[t]], device=device, dtype=torch.long)
+
+        hidden_states, past_key_values = self.decoder.model(
+            inputs_embeds=combined_embed,
+            position_ids=position_ids,
+            past_key_values=state["past_key_values"],
+            use_cache=True,
+        )
+
+        temporal_context = hidden_states[:, -1, :]
+
+        # --- Sample text token ---
+        text_logits = self.decoder.lm_head(temporal_context)
+        text_token = self._sample_token(text_logits, temperature=temperature, top_k=top_k)
+
+        # --- Depth Transformer: generate 8 audio codes ---
+        audio_codes = self.depth_decoder.generate_codes(
+            temporal_context=temporal_context,
+            text_token=text_token,
+            temperature=temperature,
+            top_k=top_k,
+        )
+
+        # --- Update state ---
+        state["past_key_values"] = past_key_values
+        state["prev_text_token"] = text_token
+        state["prev_audio_codes"] = audio_codes
+        state["temporal_step"] = t + 1
+
+        return {
+            "audio_codes": audio_codes,
+            "text_token": text_token,
+            "temporal_step": t,
+        }
+
     # ==================== Forward ====================
 
     def forward(
