@@ -41,13 +41,16 @@ _MAX_CHUNK_QUEUE_SIZE = 64
 class MoshiDuplexHandler:
     """Manages a single WebSocket session for Moshi audio streaming.
 
-    This handler implements half-duplex (turn-taking) audio streaming:
-    the client sends all audio input first, then the server streams
-    audio output back in chunks.
+    Supports two modes:
+      - **Half-duplex** (Phase 2, duplex=False): Client sends all audio
+        first, then server streams audio output back.
+      - **Full-duplex** (Phase 3, duplex=True): Client and server send
+        audio concurrently via DuplexSessionManager.
     """
 
-    def __init__(self, engine_client):
+    def __init__(self, engine_client, model=None):
         self.engine_client = engine_client
+        self.model = model  # Direct model ref for full-duplex mode
 
     async def handle(self, websocket):
         """Main entry point for a WebSocket connection."""
@@ -61,33 +64,21 @@ class MoshiDuplexHandler:
             if config is None:
                 return
 
-            # 2. Send session.created
-            await websocket.send_json(
-                SessionCreatedMessage(
-                    session_id=session_id,
-                    model=config.model,
-                    sample_rate=config.sample_rate,
-                ).model_dump()
-            )
-            logger.info(
-                "Duplex session %s: created (model=%s, sr=%d, temp=%.2f)",
-                session_id, config.model, config.sample_rate, config.temperature,
-            )
-
-            # 3. Collect audio input until audio.input.done
-            audio_buffer = await self._collect_audio_input(websocket, session_id)
-            if audio_buffer is None:
-                return
-
-            logger.info(
-                "Duplex session %s: received %d bytes of audio input",
-                session_id, len(audio_buffer),
-            )
-
-            # 4. Run Moshi pipeline, streaming output chunks
-            await self._stream_generation(
-                websocket, session_id, audio_buffer, config,
-            )
+            # 2. Route to appropriate handler based on duplex mode
+            if config.duplex and self.model is not None:
+                await self._handle_full_duplex(
+                    websocket, session_id, config,
+                )
+            else:
+                if config.duplex and self.model is None:
+                    logger.warning(
+                        "Duplex session %s: duplex=True requested but no "
+                        "direct model reference; falling back to half-duplex",
+                        session_id,
+                    )
+                await self._handle_half_duplex(
+                    websocket, session_id, config,
+                )
 
         except Exception as e:
             logger.exception("Duplex session %s: error", session_id)
@@ -102,6 +93,63 @@ class MoshiDuplexHandler:
                 pass
         finally:
             logger.info("Duplex session %s: closed", session_id)
+
+    async def _handle_full_duplex(self, websocket, session_id, config):
+        """Full-duplex mode: concurrent input/output via DuplexSessionManager."""
+        from vllm_omni.entrypoints.duplex_session import DuplexSessionManager
+
+        # Send session.created with duplex=True
+        await websocket.send_json(
+            SessionCreatedMessage(
+                session_id=session_id,
+                model=config.model,
+                sample_rate=config.sample_rate,
+                duplex=True,
+            ).model_dump()
+        )
+        logger.info(
+            "Duplex session %s: full-duplex mode (model=%s, sr=%d, temp=%.2f)",
+            session_id, config.model, config.sample_rate, config.temperature,
+        )
+
+        session = DuplexSessionManager(
+            websocket=websocket,
+            model=self.model,
+            session_id=session_id,
+            config=config,
+        )
+        await session.run()
+
+    async def _handle_half_duplex(self, websocket, session_id, config):
+        """Half-duplex mode: collect input, then stream output."""
+        # Send session.created
+        await websocket.send_json(
+            SessionCreatedMessage(
+                session_id=session_id,
+                model=config.model,
+                sample_rate=config.sample_rate,
+                duplex=False,
+            ).model_dump()
+        )
+        logger.info(
+            "Duplex session %s: half-duplex mode (model=%s, sr=%d, temp=%.2f)",
+            session_id, config.model, config.sample_rate, config.temperature,
+        )
+
+        # Collect audio input until audio.input.done
+        audio_buffer = await self._collect_audio_input(websocket, session_id)
+        if audio_buffer is None:
+            return
+
+        logger.info(
+            "Duplex session %s: received %d bytes of audio input",
+            session_id, len(audio_buffer),
+        )
+
+        # Run Moshi pipeline, streaming output chunks
+        await self._stream_generation(
+            websocket, session_id, audio_buffer, config,
+        )
 
     async def _recv_session_start(self, websocket, session_id):
         """Wait for the session.start message from the client."""

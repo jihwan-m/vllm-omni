@@ -838,7 +838,11 @@ async def audio_duplex(websocket: WebSocket):
         await websocket.close(code=1011, reason="Engine not available")
         return
 
-    handler = MoshiDuplexHandler(engine_client=engine_client)
+    # For full-duplex mode, the handler needs a direct model reference.
+    # This is set on app.state when the server is configured for Moshi.
+    model = getattr(websocket.app.state, "duplex_model", None)
+
+    handler = MoshiDuplexHandler(engine_client=engine_client, model=model)
     try:
         await handler.handle(websocket)
     except Exception:

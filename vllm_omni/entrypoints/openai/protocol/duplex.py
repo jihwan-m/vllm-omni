@@ -3,11 +3,15 @@
 """
 WebSocket message protocol for real-time Moshi audio streaming.
 
+Supports both Phase 2 (half-duplex, turn-taking) and Phase 3 (full-duplex,
+concurrent bidirectional audio).
+
 Message types:
   Client → Server:
     - session.start (JSON): Initialize session with model/audio config
     - audio.input (binary): Raw PCM audio chunk
-    - audio.input.done (JSON): Signal user finished speaking
+    - audio.input.done (JSON): Signal user finished speaking (optional in P3)
+    - interrupt (JSON): Request generation interruption (Phase 3)
     - session.end (JSON): Terminate session
 
   Server → Client:
@@ -36,6 +40,7 @@ class DuplexMessageType(str, Enum):
     SESSION_START = "session.start"
     AUDIO_INPUT = "audio.input"
     AUDIO_INPUT_DONE = "audio.input.done"
+    INTERRUPT = "interrupt"
     SESSION_END = "session.end"
 
     # Server → Client
@@ -74,12 +79,33 @@ class SessionStartMessage(BaseModel):
         le=300.0,
         description="Maximum output audio duration in seconds",
     )
+    # Phase 3: enable full-duplex (concurrent input during generation)
+    duplex: bool = Field(
+        default=False,
+        description="Enable full-duplex mode (Phase 3). When True, client "
+        "can send audio.input frames while receiving audio.output.",
+    )
 
 
 class AudioInputDoneMessage(BaseModel):
-    """Client sends this to signal that audio input is complete."""
+    """Client sends this to signal that audio input is complete.
+
+    In Phase 2 (half-duplex), this marks the end of the input turn.
+    In Phase 3 (full-duplex), this is optional — the client can continue
+    sending audio.input even after sending this (for barge-in scenarios).
+    """
 
     type: str = DuplexMessageType.AUDIO_INPUT_DONE
+
+
+class InterruptMessage(BaseModel):
+    """Client sends this to interrupt ongoing generation (Phase 3).
+
+    The server will stop generation after finishing the current temporal
+    step, clear KV cache, and prepare for a new turn.
+    """
+
+    type: str = DuplexMessageType.INTERRUPT
 
 
 class SessionEndMessage(BaseModel):
@@ -100,6 +126,7 @@ class SessionCreatedMessage(BaseModel):
     session_id: str
     model: str
     sample_rate: int
+    duplex: bool = False
 
 
 class AudioOutputMeta(BaseModel):
@@ -109,6 +136,8 @@ class AudioOutputMeta(BaseModel):
     chunk_index: int
     duration_ms: float
     is_final: bool = False
+    temporal_step: int | None = None
+    text_token: int | None = None
 
 
 class TextTokenMessage(BaseModel):
@@ -135,4 +164,5 @@ class ErrorMessage(BaseModel):
     type: str = DuplexMessageType.ERROR
     message: str
     code: str = "internal_error"
+    recoverable: bool = False
     details: dict[str, Any] | None = None

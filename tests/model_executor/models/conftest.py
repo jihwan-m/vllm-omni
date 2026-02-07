@@ -272,6 +272,17 @@ if not _vllm_available:
         os.path.join(_VLLM_OMNI_DIR, "model_executor", "models"),
     )
 
+    # Pre-register distributed hierarchy to bypass __init__.py
+    # chains that import shm_connector → stage_utils → omegaconf.
+    _register_pkg(
+        "vllm_omni.distributed",
+        os.path.join(_VLLM_OMNI_DIR, "distributed"),
+    )
+    _register_pkg(
+        "vllm_omni.distributed.omni_connectors",
+        os.path.join(_VLLM_OMNI_DIR, "distributed", "omni_connectors"),
+    )
+
     # Pre-register entrypoints hierarchy to bypass __init__.py
     # chains that import AsyncOmni, api_server, etc.
     _register_pkg(

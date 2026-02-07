@@ -1373,3 +1373,444 @@ class TestChunkProcessorReturnTypes:
         )
         assert isinstance(result["code_predictor_codes"], list)
         assert all(isinstance(c, int) for c in result["code_predictor_codes"])
+
+
+# =============================================================================
+# Phase 3: RingBuffer Tests
+# =============================================================================
+
+
+class TestRingBuffer:
+    """Test the ring buffer for continuous audio token injection."""
+
+    def test_basic_write_read(self):
+        from vllm_omni.distributed.omni_connectors.bidirectional import RingBuffer
+        rb = RingBuffer(capacity=8, num_codebooks=4)
+        rb.write([1, 2, 3, 4])
+        result = rb.read(0)
+        assert result == [1, 2, 3, 4]
+
+    def test_sequential_writes(self):
+        from vllm_omni.distributed.omni_connectors.bidirectional import RingBuffer
+        rb = RingBuffer(capacity=8, num_codebooks=2)
+        for i in range(5):
+            rb.write([i, i + 10])
+        for i in range(5):
+            assert rb.read(i) == [i, i + 10]
+
+    def test_read_unwritten_position_returns_none(self):
+        from vllm_omni.distributed.omni_connectors.bidirectional import RingBuffer
+        rb = RingBuffer(capacity=8, num_codebooks=2)
+        assert rb.read(0) is None  # Nothing written yet
+        rb.write([1, 2])
+        assert rb.read(1) is None  # Position 1 not written
+
+    def test_eviction_on_overflow(self):
+        from vllm_omni.distributed.omni_connectors.bidirectional import RingBuffer
+        rb = RingBuffer(capacity=4, num_codebooks=2)
+        # Write 6 frames — first 2 should be evicted
+        for i in range(6):
+            rb.write([i, i])
+        assert rb.read(0) is None  # Evicted
+        assert rb.read(1) is None  # Evicted
+        assert rb.read(2) == [2, 2]  # Still valid
+        assert rb.read(5) == [5, 5]  # Most recent
+
+    def test_write_pos_tracks_total(self):
+        from vllm_omni.distributed.omni_connectors.bidirectional import RingBuffer
+        rb = RingBuffer(capacity=4, num_codebooks=2)
+        assert rb.write_pos == 0
+        rb.write([1, 2])
+        rb.write([3, 4])
+        assert rb.write_pos == 2
+
+    def test_wrong_codebook_count_raises(self):
+        from vllm_omni.distributed.omni_connectors.bidirectional import RingBuffer
+        rb = RingBuffer(capacity=4, num_codebooks=8)
+        with pytest.raises(ValueError, match="Expected 8 codes"):
+            rb.write([1, 2, 3])
+
+    def test_reset_clears_all(self):
+        from vllm_omni.distributed.omni_connectors.bidirectional import RingBuffer
+        rb = RingBuffer(capacity=4, num_codebooks=2)
+        rb.write([1, 2])
+        rb.write([3, 4])
+        rb.reset()
+        assert rb.write_pos == 0
+        assert rb.read(0) is None
+
+    def test_available_count(self):
+        from vllm_omni.distributed.omni_connectors.bidirectional import RingBuffer
+        rb = RingBuffer(capacity=4, num_codebooks=2)
+        assert rb.available() == 0
+        rb.write([1, 2])
+        rb.write([3, 4])
+        assert rb.available() == 2
+        # Overflow: write 3 more (total 5, capacity 4)
+        rb.write([5, 6])
+        rb.write([7, 8])
+        rb.write([9, 10])
+        assert rb.available() == 4  # Capped at capacity
+
+    def test_thread_safety(self):
+        """Concurrent reads and writes should not crash or corrupt data."""
+        import threading
+        from vllm_omni.distributed.omni_connectors.bidirectional import RingBuffer
+        rb = RingBuffer(capacity=64, num_codebooks=4)
+
+        errors = []
+
+        def writer():
+            for i in range(200):
+                rb.write([i % 100] * 4)
+
+        def reader():
+            for _ in range(200):
+                pos = max(0, rb.write_pos - 1)
+                result = rb.read(pos)
+                if result is not None and len(result) != 4:
+                    errors.append(f"Bad length: {len(result)}")
+
+        t1 = threading.Thread(target=writer)
+        t2 = threading.Thread(target=reader)
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+        assert errors == []
+
+
+# =============================================================================
+# Phase 3: BidirectionalChannel Tests
+# =============================================================================
+
+
+class TestBidirectionalChannel:
+    """Test the bidirectional communication channel."""
+
+    def test_create_channel(self):
+        from vllm_omni.distributed.omni_connectors.bidirectional import (
+            BidirectionalChannel,
+        )
+        ch = BidirectionalChannel(
+            session_id="test-session",
+            buffer_capacity=32,
+            output_queue_size=16,
+        )
+        assert ch.session_id == "test-session"
+        assert not ch.closed
+        assert ch.input_write_pos == 0
+
+    def test_put_and_get_input(self):
+        from vllm_omni.distributed.omni_connectors.bidirectional import (
+            BidirectionalChannel,
+        )
+        ch = BidirectionalChannel(
+            session_id="test", num_codebooks=4,
+        )
+        ch.put_input([10, 20, 30, 40])
+        result = ch.get_input(0)
+        assert result == [10, 20, 30, 40]
+        assert ch.input_write_pos == 1
+
+    def test_close_sets_flag(self):
+        import asyncio
+        from vllm_omni.distributed.omni_connectors.bidirectional import (
+            BidirectionalChannel,
+        )
+        ch = BidirectionalChannel(session_id="test")
+        loop = asyncio.new_event_loop()
+        ch.bind_loop(loop)
+        ch.close()
+        assert ch.closed
+        loop.close()
+
+    def test_control_signal_roundtrip(self):
+        import asyncio
+        from vllm_omni.distributed.omni_connectors.bidirectional import (
+            BidirectionalChannel,
+            ControlSignal,
+        )
+        ch = BidirectionalChannel(session_id="test")
+        loop = asyncio.new_event_loop()
+        ch.bind_loop(loop)
+
+        # Put control signal directly
+        ch.control_queue.put_nowait(ControlSignal.INTERRUPT)
+        signal = ch.poll_control()
+        assert signal == ControlSignal.INTERRUPT
+
+        # No more signals
+        assert ch.poll_control() is None
+        loop.close()
+
+
+# =============================================================================
+# Phase 3: OutputFrame and ControlSignal Tests
+# =============================================================================
+
+
+class TestOutputFrameAndControlSignal:
+    """Test data types for channel communication."""
+
+    def test_output_frame_defaults(self):
+        from vllm_omni.distributed.omni_connectors.bidirectional import OutputFrame
+        frame = OutputFrame(audio_codes=[1, 2, 3, 4, 5, 6, 7, 8])
+        assert frame.text_token is None
+        assert frame.temporal_step == 0
+        assert len(frame.audio_codes) == 8
+
+    def test_output_frame_with_text(self):
+        from vllm_omni.distributed.omni_connectors.bidirectional import OutputFrame
+        frame = OutputFrame(
+            audio_codes=[0] * 8,
+            text_token=42,
+            temporal_step=10,
+        )
+        assert frame.text_token == 42
+        assert frame.temporal_step == 10
+
+    def test_control_signal_values(self):
+        from vllm_omni.distributed.omni_connectors.bidirectional import ControlSignal
+        assert ControlSignal.INTERRUPT.value == "interrupt"
+        assert ControlSignal.SHUTDOWN.value == "shutdown"
+        assert ControlSignal.PAUSE.value == "pause"
+        assert ControlSignal.RESUME.value == "resume"
+
+
+# =============================================================================
+# Phase 3: DuplexStageWorker Tests
+# =============================================================================
+
+
+class TestDuplexStageWorker:
+    """Test the event-driven stage worker for full-duplex generation."""
+
+    def _make_fake_model(self, num_codebooks=4, device_str="cpu"):
+        """Create a fake model with streaming methods."""
+        import types
+        import torch.nn as nn
+        from vllm_omni.model_executor.models.moshi.moshi import (
+            MoshiForConditionalGenerationVLLM,
+            MoshiTemporalDecoder,
+            MoshiDepthDecoder,
+        )
+
+        config = FakeMoshiConfig(
+            vocab_size=64, hidden_size=32, num_hidden_layers=1,
+            num_attention_heads=4, num_key_value_heads=4, ffn_dim=64,
+            head_dim=8, audio_vocab_size=32, num_codebooks=num_codebooks,
+        )
+        config.depth_decoder_config = FakeDepthConfig(
+            vocab_size=64, hidden_size=16, input_size=32,
+            num_hidden_layers=1, num_attention_heads=4,
+            num_key_value_heads=4, ffn_dim=32, head_dim=4,
+            audio_vocab_size=32, num_codebooks=num_codebooks,
+        )
+
+        model = type("FakeModel", (nn.Module,), {
+            "__init__": lambda self_: nn.Module.__init__(self_),
+        })()
+        model.num_codebooks = config.num_codebooks
+        model.vocab_size = config.vocab_size
+        model.hidden_size = config.hidden_size
+        model.embed_tokens = nn.ModuleList([
+            nn.Embedding(config.audio_vocab_size + 1, config.hidden_size)
+            for _ in range(2 * config.num_codebooks)
+        ])
+        model.decoder = MoshiTemporalDecoder(config)
+        model.depth_decoder = MoshiDepthDecoder(config.depth_decoder_config)
+
+        model.init_streaming_state = types.MethodType(
+            MoshiForConditionalGenerationVLLM.init_streaming_state, model,
+        )
+        model.clear_streaming_state = types.MethodType(
+            MoshiForConditionalGenerationVLLM.clear_streaming_state, model,
+        )
+        model.forward_dialogue_step = types.MethodType(
+            MoshiForConditionalGenerationVLLM.forward_dialogue_step, model,
+        )
+        model._sample_token = MoshiForConditionalGenerationVLLM._sample_token
+        return model
+
+    def test_worker_runs_and_produces_output(self):
+        """Worker should run a few steps and put frames into channel."""
+        import asyncio
+        import threading
+        from vllm_omni.distributed.omni_connectors.bidirectional import (
+            BidirectionalChannel,
+        )
+        from vllm_omni.entrypoints.duplex_stage_worker import DuplexStageWorker
+
+        model = self._make_fake_model(num_codebooks=4)
+        ch = BidirectionalChannel(
+            session_id="test-worker",
+            num_codebooks=4,
+            output_queue_size=32,
+        )
+
+        # Pre-fill ring buffer with 3 frames of user audio
+        for i in range(3):
+            ch.put_input([0, 0, 0, 0])
+
+        worker = DuplexStageWorker(
+            model=model,
+            channel=ch,
+            request_id="test-worker",
+            temperature=0.0,
+            max_steps=3,
+        )
+
+        # Run worker + event loop concurrently
+        async def _run_test():
+            ch.bind_loop(asyncio.get_event_loop())
+            # Run worker in a thread
+            await asyncio.to_thread(worker.run)
+
+            # Collect output frames from queue
+            frames = []
+            while not ch.forward_queue.empty():
+                frame = ch.forward_queue.get_nowait()
+                if frame is not None:
+                    frames.append(frame)
+
+            assert len(frames) == 3
+            for i, frame in enumerate(frames):
+                assert frame.temporal_step == i
+                assert len(frame.audio_codes) == 4
+
+        asyncio.run(_run_test())
+
+    def test_worker_handles_shutdown_signal(self):
+        """Worker should stop on SHUTDOWN control signal."""
+        import asyncio
+        from vllm_omni.distributed.omni_connectors.bidirectional import (
+            BidirectionalChannel,
+            ControlSignal,
+        )
+        from vllm_omni.entrypoints.duplex_stage_worker import DuplexStageWorker
+
+        model = self._make_fake_model(num_codebooks=4)
+        ch = BidirectionalChannel(
+            session_id="test-shutdown",
+            num_codebooks=4,
+        )
+
+        # Pre-fill many frames so worker won't stop due to input shortage
+        for _ in range(100):
+            ch.put_input([0, 0, 0, 0])
+
+        worker = DuplexStageWorker(
+            model=model,
+            channel=ch,
+            request_id="test-shutdown",
+            max_steps=1000,
+        )
+
+        async def _run_test():
+            ch.bind_loop(asyncio.get_event_loop())
+
+            # Send SHUTDOWN after a short delay
+            async def _send_shutdown():
+                await asyncio.sleep(0.2)
+                ch.control_queue.put_nowait(ControlSignal.SHUTDOWN)
+
+            await asyncio.gather(
+                asyncio.to_thread(worker.run),
+                _send_shutdown(),
+            )
+
+            # Worker should have stopped before max_steps
+            assert worker._temporal_step < 1000
+
+        asyncio.run(_run_test())
+
+    def test_worker_uses_silence_when_no_input(self):
+        """Worker should use silence when no user audio is available."""
+        import asyncio
+        from vllm_omni.distributed.omni_connectors.bidirectional import (
+            BidirectionalChannel,
+        )
+        from vllm_omni.entrypoints.duplex_stage_worker import DuplexStageWorker
+
+        model = self._make_fake_model(num_codebooks=4)
+        ch = BidirectionalChannel(
+            session_id="test-silence",
+            num_codebooks=4,
+        )
+
+        # Don't write any input — worker should still run with silence
+        worker = DuplexStageWorker(
+            model=model,
+            channel=ch,
+            request_id="test-silence",
+            max_steps=2,
+        )
+
+        async def _run_test():
+            ch.bind_loop(asyncio.get_event_loop())
+            await asyncio.to_thread(worker.run)
+
+            frames = []
+            while not ch.forward_queue.empty():
+                frame = ch.forward_queue.get_nowait()
+                if frame is not None:
+                    frames.append(frame)
+            assert len(frames) == 2
+
+        asyncio.run(_run_test())
+
+
+# =============================================================================
+# Phase 3: Protocol Updates Tests
+# =============================================================================
+
+
+class TestDuplexProtocolPhase3:
+    """Test Phase 3 additions to the duplex protocol."""
+
+    def test_session_start_duplex_default_false(self):
+        from vllm_omni.entrypoints.openai.protocol.duplex import SessionStartMessage
+        msg = SessionStartMessage()
+        assert msg.duplex is False
+
+    def test_session_start_duplex_true(self):
+        from vllm_omni.entrypoints.openai.protocol.duplex import SessionStartMessage
+        msg = SessionStartMessage(duplex=True)
+        assert msg.duplex is True
+
+    def test_session_created_duplex_field(self):
+        from vllm_omni.entrypoints.openai.protocol.duplex import SessionCreatedMessage
+        msg = SessionCreatedMessage(
+            session_id="abc", model="moshi", sample_rate=24000, duplex=True,
+        )
+        data = msg.model_dump()
+        assert data["duplex"] is True
+
+    def test_interrupt_message(self):
+        from vllm_omni.entrypoints.openai.protocol.duplex import (
+            DuplexMessageType,
+            InterruptMessage,
+        )
+        msg = InterruptMessage()
+        assert msg.type == DuplexMessageType.INTERRUPT
+
+    def test_audio_output_meta_temporal_step(self):
+        from vllm_omni.entrypoints.openai.protocol.duplex import AudioOutputMeta
+        meta = AudioOutputMeta(
+            chunk_index=5, duration_ms=80.0, temporal_step=42, text_token=99,
+        )
+        data = meta.model_dump()
+        assert data["temporal_step"] == 42
+        assert data["text_token"] == 99
+
+    def test_error_message_recoverable(self):
+        from vllm_omni.entrypoints.openai.protocol.duplex import ErrorMessage
+        msg = ErrorMessage(
+            message="timeout", code="timeout", recoverable=True,
+        )
+        assert msg.recoverable is True
+
+    def test_message_type_has_interrupt(self):
+        from vllm_omni.entrypoints.openai.protocol.duplex import DuplexMessageType
+        assert DuplexMessageType.INTERRUPT == "interrupt"
