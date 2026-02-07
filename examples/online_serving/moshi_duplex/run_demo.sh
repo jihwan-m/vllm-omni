@@ -182,7 +182,7 @@ if [ "$SKIP_INSTALL" = false ]; then
 
     # Install vLLM
     echo "Installing vLLM..."
-    pip install -q vllm==0.15.0 --torch-backend=auto 2>&1 | tail -1
+    pip install -q vllm 2>&1 | tail -1
 
     # Install vllm-omni
     echo "Installing vllm-omni..."
