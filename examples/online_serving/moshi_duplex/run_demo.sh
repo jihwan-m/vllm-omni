@@ -32,9 +32,25 @@ else
     exit 1
 fi
 
+# ----------------------------- Platform Check ---------------------------------
+# vLLM requires Linux — warn if running on Windows/MINGW directly
+if [[ "${OSTYPE:-}" == msys* ]] || [[ "${OSTYPE:-}" == mingw* ]] || [[ "${MSYSTEM:-}" != "" ]]; then
+    echo "WARNING: vLLM requires Linux. Detected Windows/MINGW environment."
+    echo "  Please use WSL2 instead:"
+    echo "    wsl"
+    echo "    cd $(pwd)"
+    echo "    bash examples/online_serving/moshi_duplex/run_demo.sh --quantized"
+    echo ""
+    read -r -p "Continue anyway? (y/N) " _confirm
+    [[ "$_confirm" =~ ^[Yy]$ ]] || exit 0
+fi
+
 # ----------------------------- Package Installer Detection -------------------
 # Prefer uv (10-100x faster than pip) if available
-if command -v uv &>/dev/null; then
+# Skip uv in MINGW/MSYS — it misdetects platform as manylinux
+if [[ "${OSTYPE:-}" == msys* ]] || [[ "${OSTYPE:-}" == mingw* ]]; then
+    PIP="pip"
+elif command -v uv &>/dev/null; then
     PIP="uv pip"
     echo "Using uv for fast package installation."
 else
