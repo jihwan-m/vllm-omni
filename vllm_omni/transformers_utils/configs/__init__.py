@@ -17,13 +17,10 @@ _CLASS_TO_MODULE: dict[str, str] = {
     "FishSpeechConfig": "vllm_omni.transformers_utils.configs.fish_speech",
     "FishSpeechSlowARConfig": "vllm_omni.transformers_utils.configs.fish_speech",
     "FishSpeechFastARConfig": "vllm_omni.transformers_utils.configs.fish_speech",
-    "VoxCPMConfig": "vllm_omni.transformers_utils.configs.voxcpm",
     "VoxCPM2Config": "vllm_omni.transformers_utils.configs.voxcpm2",
-    "BailingMoeV2Config": "vllm_omni.transformers_utils.configs.ming_flash_omni",
-    "BailingMM2Config": "vllm_omni.transformers_utils.configs.ming_flash_omni",
-    "MingFlashOmniConfig": "vllm_omni.transformers_utils.configs.ming_flash_omni",
-    "Qwen3VLMoeVisionConfig": "vllm_omni.transformers_utils.configs.ming_flash_omni",
-    "WhisperEncoderConfig": "vllm_omni.transformers_utils.configs.ming_flash_omni",
+    "RaonConfig": "vllm_omni.transformers_utils.configs.raon",
+    "EmbeddingAdaptorConfig": "vllm_omni.transformers_utils.configs.raon",
+    "SpeakerEncoderConfig": "vllm_omni.transformers_utils.configs.raon",
 }
 
 __all__ = [
@@ -34,13 +31,10 @@ __all__ = [
     "FishSpeechConfig",
     "FishSpeechSlowARConfig",
     "FishSpeechFastARConfig",
-    "VoxCPMConfig",
     "VoxCPM2Config",
-    "BailingMoeV2Config",
-    "BailingMM2Config",
-    "MingFlashOmniConfig",
-    "Qwen3VLMoeVisionConfig",
-    "WhisperEncoderConfig",
+    "EmbeddingAdaptorConfig",
+    "RaonConfig",
+    "SpeakerEncoderConfig",
 ]
 
 
@@ -61,6 +55,5 @@ def __dir__():
 # run as soon as `vllm_omni.transformers_utils.configs` is imported.
 from vllm_omni.transformers_utils.configs import fish_speech as _fish_speech  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import mammoth_moda2 as _mammoth_moda2  # noqa: F401, E402
-from vllm_omni.transformers_utils.configs import ming_flash_omni as _ming_flash_omni  # noqa: F401, E402
-from vllm_omni.transformers_utils.configs import voxcpm as _voxcpm  # noqa: F401, E402
+from vllm_omni.transformers_utils.configs import raon as _raon  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import voxcpm2 as _voxcpm2  # noqa: F401, E402

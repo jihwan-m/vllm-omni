@@ -4,12 +4,10 @@
 import threading
 from collections import deque
 from types import SimpleNamespace
-from unittest.mock import patch
 
 import pytest
 import torch
 from pytest_mock import MockerFixture
-from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
 from vllm.v1.request import RequestStatus
 
 from vllm_omni.distributed.omni_connectors.transfer_adapter.base import OmniTransferAdapterBase
@@ -182,6 +180,30 @@ def test_process_and_restore_queues(build_adapter):
     assert adapter.waiting_for_chunk_running_requests == deque()
 
 
+def test_process_pending_chunks_skips_finalized_requests(build_adapter):
+    """Requests already finalized (cleanup ran, is_finished()==True) must not
+    be re-parked as WAITING_FOR_CHUNK, which would create zombie requests."""
+    adapter, _ = build_adapter(stage_id=1, max_num_seqs=8)
+
+    # Simulate a request that has been finalized: cleanup() already discarded
+    # it from finished_requests, but it is still physically in the running queue.
+    finished_req = _req("fin1", RequestStatus.FINISHED_STOPPED)
+    live_req = _req("live1", RequestStatus.RUNNING)
+
+    running_queue = [finished_req, live_req]
+    waiting_queue = DummyWaitingQueue()
+
+    adapter.process_pending_chunks(waiting_queue, running_queue)
+
+    # Finalized request must NOT be parked (status unchanged, not moved to chunk deque).
+    assert finished_req.status == RequestStatus.FINISHED_STOPPED
+    assert finished_req not in adapter.waiting_for_chunk_running_requests
+
+    # Live request without a ready chunk should be parked normally.
+    assert live_req.status == RequestStatus.WAITING_FOR_CHUNK
+    assert live_req in adapter.waiting_for_chunk_running_requests
+
+
 def test_postprocess_scheduler_output(build_adapter):
     adapter, _ = build_adapter()
     adapter.requests_with_ready_chunks = {"new-ready", "cached-ready", "leftover"}
@@ -335,27 +357,6 @@ def test_cleanup_after_poll_flow(build_adapter):
     assert "req-flow" not in adapter.get_req_chunk
     assert "req-flow" not in adapter.request_ids_mapping
     assert "ext-flow" not in adapter.request_payload
-
-
-def test_finish_requests_restores_status(build_adapter):
-    """Abort path must pop ``requests_origin_status`` and restore pre-wait status.
-
-    While ``process_pending_chunks`` holds a request off the scheduler queues, the
-    adapter records the prior status (WAITING or RUNNING). ``finish_requests`` must
-    put that status back on the live ``Request`` so base ``Scheduler.finish_requests``
-    can finish bookkeeping without inconsistent state / crashes.
-    """
-    adapter, _ = build_adapter(stage_id=1)
-    req_id = "req-abort-during-chunk"
-    prior = RequestStatus.RUNNING
-    request = _req(req_id, RequestStatus.WAITING_FOR_CHUNK)
-    adapter.requests_origin_status[req_id] = prior
-    requests_map = {req_id: request}
-
-    adapter.finish_requests([req_id], RequestStatus.FINISHED_ABORTED, requests_map)
-
-    assert request.status == prior
-    assert req_id not in adapter.requests_origin_status
 
 
 # ---------------------------------------------------------------
@@ -531,31 +532,3 @@ def test_ar_scheduler_defers_cleanup_and_queues_save_on_finished(mocker: MockerF
 
     assert len(cleanup_calls) == 0
     assert len(save_calls) == 1
-
-
-def test_omni_ar_scheduler_finish_requests(mocker: MockerFixture):
-    """``OmniARScheduler.finish_requests`` must run chunk adapter hook before vLLM base."""
-    from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
-
-    order: list[str] = []
-
-    adapter = mocker.MagicMock()
-
-    def _adapter_finish(request_ids, finished_status, requests):
-        order.append("adapter")
-        return []
-
-    adapter.finish_requests.side_effect = _adapter_finish
-
-    def _super_finish(_self, request_ids, finished_status):
-        order.append("super")
-        return []
-
-    sched = OmniARScheduler.__new__(OmniARScheduler)
-    sched.chunk_transfer_adapter = adapter
-    sched.requests = {}
-
-    with patch.object(VLLMScheduler, "finish_requests", _super_finish):
-        OmniARScheduler.finish_requests(sched, ["r1"], RequestStatus.FINISHED_ABORTED)
-
-    assert order == ["adapter", "super"]
