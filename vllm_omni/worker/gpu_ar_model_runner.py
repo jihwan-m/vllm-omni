@@ -262,10 +262,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             # Update persistent batch states.
             deferred_state_corrections_fn = self._update_states(scheduler_output)
 
-            # Notify model of finished requests for state cleanup
-            if scheduler_output.finished_req_ids and hasattr(self.model, "on_requests_finished"):
-                self.model.on_requests_finished(scheduler_output.finished_req_ids)
-
             if has_ec_transfer() and not get_ec_transfer().is_consumer:
                 with self.maybe_get_ec_connector_output(
                     scheduler_output,
@@ -788,7 +784,10 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             sched = int(num_scheduled_tokens_np[idx])
             end = start + sched
             hidden_slice = hidden_states_cpu[start:end]
-            payload: dict[str, object] = {"hidden": hidden_slice}
+            # Skip hidden states in AR payload when the downstream stage does not use them.
+            payload: dict[str, object] = {}
+            if getattr(self.model, "emit_hidden_in_payload", True):
+                payload["hidden"] = hidden_slice
             if mm_cpu:
                 mm_payload: dict[str, object] = {}
                 for k, v in mm_cpu.items():
@@ -797,14 +796,14 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     elif isinstance(v, dict):
                         mm_payload[k] = {sk: sv[start:end].contiguous() for sk, sv in v.items()}
                     elif isinstance(v, list):
-                        if idx < len(v):
-                            element = v[idx]
-                            if element is not None:
-                                if isinstance(element, torch.Tensor):
-                                    element = element.clone()
-                                mm_payload[k] = element
-                        # Skip None elements: msgspec cannot serialize None
-                        # in dict[str, torch.Tensor] typed fields.
+                        element = v[idx] if idx < len(v) else v[0]
+                        # Some models may emit None for requests without multimodal output.
+                        if element is None:
+                            continue
+                        # Clone tensors to avoid cross-request aliasing
+                        if isinstance(element, torch.Tensor):
+                            element = element.clone()
+                        mm_payload[k] = element
                     elif isinstance(v, torch.Tensor):
                         # List-derived tensor payloads are request-invariant; clone to
                         # avoid accidental cross-request aliasing on downstream mutation.

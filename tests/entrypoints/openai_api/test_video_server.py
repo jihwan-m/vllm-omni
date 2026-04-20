@@ -69,7 +69,7 @@ class BlockingVideoHandler:
         if self.stage_configs is None:
             self.stage_configs = stage_configs
 
-    async def generate_video_bytes(self, request, reference_id, *, reference_image=None):
+    async def generate_videos(self, request, reference_id, *, reference_image=None):
         self.started.set()
         try:
             await asyncio.Future()
@@ -137,81 +137,15 @@ def _wait_until(predicate, timeout_s: float = 2.0, interval_s: float = 0.02):
     raise AssertionError("Timed out waiting for condition")
 
 
-def test_async_video_generation_bypasses_base64(test_client, mocker: MockerFixture):
-    """Regression test: Ensure async video generation saves raw bytes directly
-    without bouncing through base64 encoding."""
-    # We mock _encode_video_bytes (the correct path)
-    mocker.patch(
-        "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
-        return_value=b"raw-mp4-bytes",
-    )
-
-    # We assert that encode_video_base64 is never called
-    mock_base64 = mocker.patch(
-        "vllm_omni.entrypoints.openai.serving_video.encode_video_base64",
-        side_effect=RuntimeError("Regression: async video path should not base64 encode"),
-    )
-
-    response = test_client.post(
-        "/v1/videos",
-        data={"prompt": "A base64 test."},
-    )
-    assert response.status_code == 200
-    video_id = response.json()["id"]
-
-    # Wait for completion. If it used base64, the RuntimeError would fail the task
-    _wait_for_status(test_client, video_id, VideoGenerationStatus.COMPLETED.value)
-    mock_base64.assert_not_called()
-
-
-def test_async_video_generation_with_audio_bypasses_base64(test_client, mocker: MockerFixture):
-    """Regression test: Ensure async video generation passes audio through
-    generate_video_bytes without bouncing through base64 encoding."""
-    mock_encode = mocker.patch(
-        "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
-        return_value=b"raw-mp4-bytes",
-    )
-
-    mock_base64 = mocker.patch(
-        "vllm_omni.entrypoints.openai.serving_video.encode_video_base64",
-        side_effect=RuntimeError("Regression: async video path should not base64 encode"),
-    )
-
-    engine = test_client.app.state.openai_serving_video._engine_client
-
-    async def _generate(prompt, request_id, sampling_params_list):
-        engine.captured_prompt = prompt
-        engine.captured_sampling_params_list = sampling_params_list
-        yield MockVideoResult([object()], audios=[object()], sample_rate=48000)
-
-    engine.generate = _generate
-
-    response = test_client.post(
-        "/v1/videos",
-        data={"prompt": "A base64 test with audio."},
-    )
-    assert response.status_code == 200
-    video_id = response.json()["id"]
-
-    _wait_for_status(test_client, video_id, VideoGenerationStatus.COMPLETED.value)
-    mock_base64.assert_not_called()
-
-    mock_encode.assert_called_once()
-    kwargs = mock_encode.call_args.kwargs
-    assert "audio" in kwargs
-    assert kwargs["audio"] is not None
-    assert kwargs["audio_sample_rate"] == 48000
-
-
 def test_t2v_video_generation_form(test_client, mocker: MockerFixture):
     fps_values = []
 
-    def _fake_encode(video, fps, audio=None, audio_sample_rate=None, **kwargs):
+    def _fake_encode(video, fps):
         fps_values.append(fps)
-        return b"fake-video"
+        return "Zg=="
 
     mocker.patch(
-        "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
+        "vllm_omni.entrypoints.openai.serving_video.encode_video_base64",
         side_effect=_fake_encode,
     )
     response = test_client.post(
@@ -243,8 +177,8 @@ def test_i2v_video_generation_form(test_client, mocker: MockerFixture):
     image_bytes = _make_test_image_bytes((48, 32))
 
     mocker.patch(
-        "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
-        return_value=b"fake-video",
+        "vllm_omni.entrypoints.openai.serving_video.encode_video_base64",
+        return_value="Zg==",
     )
     response = test_client.post(
         "/v1/videos",
@@ -269,8 +203,8 @@ def test_i2v_video_generation_resizes_input_to_requested_dimensions(test_client,
     image_bytes = _make_test_image_bytes((48, 32))
 
     mocker.patch(
-        "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
-        return_value=b"fake-video",
+        "vllm_omni.entrypoints.openai.serving_video.encode_video_base64",
+        return_value="Zg==",
     )
     response = test_client.post(
         "/v1/videos",
@@ -295,8 +229,8 @@ def test_i2v_video_generation_resizes_input_to_requested_dimensions(test_client,
 
 def test_i2v_video_generation_with_image_reference_form(test_client, mocker: MockerFixture):
     mocker.patch(
-        "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
-        return_value=b"fake-video",
+        "vllm_omni.entrypoints.openai.serving_video.encode_video_base64",
+        return_value="Zg==",
     )
     response = test_client.post(
         "/v1/videos",
@@ -320,12 +254,12 @@ def test_i2v_video_generation_with_image_reference_form(test_client, mocker: Moc
 def test_seconds_defaults_fps_and_frames(test_client, mocker: MockerFixture):
     fps_values = []
 
-    def _fake_encode(video, fps, audio=None, audio_sample_rate=None, **kwargs):
+    def _fake_encode(video, fps):
         fps_values.append(fps)
-        return b"fake-video"
+        return "Zg=="
 
     mocker.patch(
-        "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
+        "vllm_omni.entrypoints.openai.serving_video.encode_video_base64",
         side_effect=_fake_encode,
     )
     response = test_client.post(
@@ -349,8 +283,8 @@ def test_seconds_defaults_fps_and_frames(test_client, mocker: MockerFixture):
 
 def test_size_param_sets_width_height(test_client, mocker: MockerFixture):
     mocker.patch(
-        "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
-        return_value=b"fake-video",
+        "vllm_omni.entrypoints.openai.serving_video.encode_video_base64",
+        return_value="Zg==",
     )
     response = test_client.post(
         "/v1/videos",
@@ -371,8 +305,8 @@ def test_size_param_sets_width_height(test_client, mocker: MockerFixture):
 
 def test_sampling_params_pass_through(test_client, mocker: MockerFixture):
     mocker.patch(
-        "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
-        return_value=b"fake-video",
+        "vllm_omni.entrypoints.openai.serving_video.encode_video_base64",
+        return_value="Zg==",
     )
     response = test_client.post(
         "/v1/videos",
@@ -403,10 +337,10 @@ def test_sampling_params_pass_through(test_client, mocker: MockerFixture):
 def test_audio_sample_rate_comes_from_model_config(test_client, mocker: MockerFixture):
     audio_sample_rates = []
 
-    def _fake_encode(video, fps, audio=None, audio_sample_rate=None, video_codec_options=None):
-        del video, fps, audio, video_codec_options
+    def _fake_encode(video, fps, audio=None, audio_sample_rate=None):
+        del video, fps, audio
         audio_sample_rates.append(audio_sample_rate)
-        return b"fake-video"
+        return "Zg=="
 
     engine = test_client.app.state.openai_serving_video._engine_client
     engine.model_config = SimpleNamespace(
@@ -420,14 +354,12 @@ def test_audio_sample_rate_comes_from_model_config(test_client, mocker: MockerFi
     async def _generate(prompt, request_id, sampling_params_list):
         engine.captured_prompt = prompt
         engine.captured_sampling_params_list = sampling_params_list
-        import numpy as np
-
-        yield MockVideoResult([np.zeros((1, 64, 64, 3), dtype=np.uint8)], audios=[object()])
+        yield MockVideoResult([object()], audios=[object()])
 
     engine.generate = _generate
 
     mocker.patch(
-        "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
+        "vllm_omni.entrypoints.openai.serving_video.encode_video_base64",
         side_effect=_fake_encode,
     )
     response = test_client.post(
@@ -455,8 +387,8 @@ def test_video_job_persists_profiler_metadata(test_client, mocker: MockerFixture
 
     engine.generate = _generate
     mocker.patch(
-        "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
-        return_value=b"fake-video",
+        "vllm_omni.entrypoints.openai.serving_video.encode_video_base64",
+        return_value="Zg==",
     )
 
     response = test_client.post("/v1/videos", data={"prompt": "profile me"})
@@ -525,8 +457,8 @@ def test_invalid_seconds_returns_422(test_client):
 
 def test_negative_prompt_and_seed_pass_through(test_client, mocker: MockerFixture):
     mocker.patch(
-        "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
-        return_value=b"fake-video",
+        "vllm_omni.entrypoints.openai.serving_video.encode_video_base64",
+        return_value="Zg==",
     )
     response = test_client.post(
         "/v1/videos",
@@ -599,8 +531,8 @@ def test_video_request_validation():
 
 def test_list_videos_supports_order_after_and_limit(test_client, mocker: MockerFixture):
     mocker.patch(
-        "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
-        return_value=b"fake-video",
+        "vllm_omni.entrypoints.openai.serving_video.encode_video_base64",
+        return_value="Zg==",
     )
     ids = []
     for i in range(3):
@@ -668,8 +600,8 @@ def test_list_videos_supports_order_after_and_limit(test_client, mocker: MockerF
 
 def test_delete_completed_job_removes_file_and_metadata(test_client, mocker: MockerFixture):
     mocker.patch(
-        "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
-        return_value=b"fake-video",
+        "vllm_omni.entrypoints.openai.serving_video.encode_video_base64",
+        return_value="Zg==",
     )
     create_resp = test_client.post("/v1/videos", data={"prompt": "Delete this video"})
     assert create_resp.status_code == 200
@@ -740,8 +672,8 @@ def test_video_response_file_extension_is_robust():
 def test_extra_params_merged_into_extra_args(test_client, mocker: MockerFixture):
     """extra_params JSON object is merged into sampling_params.extra_args."""
     mocker.patch(
-        "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
-        return_value=b"fake-video",
+        "vllm_omni.entrypoints.openai.serving_video.encode_video_base64",
+        return_value="Zg==",
     )
     extra_params = {
         "is_enable_stage2": True,
@@ -771,8 +703,8 @@ def test_extra_params_merged_into_extra_args(test_client, mocker: MockerFixture)
 def test_extra_params_none_by_default(test_client, mocker: MockerFixture):
     """When extra_params is omitted, extra_args stays empty."""
     mocker.patch(
-        "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
-        return_value=b"fake-video",
+        "vllm_omni.entrypoints.openai.serving_video.encode_video_base64",
+        return_value="Zg==",
     )
     response = test_client.post(
         "/v1/videos",
@@ -812,8 +744,8 @@ def test_extra_params_invalid_json(test_client):
 def test_extra_params_merged_with_existing_extra_args(test_client, mocker: MockerFixture):
     """extra_params is merged on top of existing extra_args (e.g. flow_shift)."""
     mocker.patch(
-        "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
-        return_value=b"fake-video",
+        "vllm_omni.entrypoints.openai.serving_video.encode_video_base64",
+        return_value="Zg==",
     )
     response = test_client.post(
         "/v1/videos",
@@ -837,8 +769,8 @@ def test_extra_params_merged_with_existing_extra_args(test_client, mocker: Mocke
 def test_sample_solver_forwarded_via_extra_params(test_client, mocker: MockerFixture):
     """sample_solver can be passed through existing extra_params for Wan2.2 online serving."""
     mocker.patch(
-        "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
-        return_value=b"fake-video",
+        "vllm_omni.entrypoints.openai.serving_video.encode_video_base64",
+        return_value="Zg==",
     )
     response = test_client.post(
         "/v1/videos",

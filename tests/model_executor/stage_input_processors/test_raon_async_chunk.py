@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Tests for Raon stage0_to_stage1_async_chunk and async_chunk_cleanup_request."""
+"""Tests for Raon stage0_to_stage1_async_chunk (async-chunk emission and finish-tick cleanup)."""
 
 from __future__ import annotations
 
@@ -12,11 +12,7 @@ import torch
 import yaml
 
 from vllm_omni.model_executor.stage_input_processors.raon import (
-    _ASYNC_ALL_CODES,
-    _ASYNC_EMITTED_FRAMES,
-    _ASYNC_REQ_ID_MAP,
     _DEFAULT_CHUNK_FRAMES,
-    async_chunk_cleanup_request,
     stage0_to_stage1_async_chunk,
 )
 
@@ -69,30 +65,14 @@ def _pooling(*, chunk: torch.Tensor | None = None, full: torch.Tensor | None = N
     return out
 
 
-def _cleanup(*req_ids: str) -> None:
-    for rid in req_ids:
-        _ASYNC_ALL_CODES.pop(rid, None)
-        _ASYNC_EMITTED_FRAMES.pop(rid, None)
-        stale = [k for k, v in list(_ASYNC_REQ_ID_MAP.items()) if v == rid or k == rid]
-        for k in stale:
-            _ASYNC_REQ_ID_MAP.pop(k, None)
-
-
-@pytest.fixture(autouse=True)
-def _clean_state():
-    yield
-    for store in (_ASYNC_ALL_CODES, _ASYNC_EMITTED_FRAMES, _ASYNC_REQ_ID_MAP):
-        store.clear()
-
-
 # ===================================================================
 # YAML config validation
 # ===================================================================
 
 
-def test_raon_stage_yaml_wires_codec_chunk_frames_25():
+def test_raon_async_chunk_yaml_wires_codec_chunk_frames_25():
     root = Path(__file__).resolve().parents[3]
-    path = root / "vllm_omni" / "model_executor" / "stage_configs" / "raon.yaml"
+    path = root / "vllm_omni" / "model_executor" / "stage_configs" / "raon_async_chunk.yaml"
     data = yaml.safe_load(path.read_text())
     assert data.get("async_chunk") is True
     extra = data["runtime"]["connectors"]["connector_of_shared_memory"]["extra"]
@@ -100,38 +80,11 @@ def test_raon_stage_yaml_wires_codec_chunk_frames_25():
     assert int(extra["codec_left_context_frames"]) == 25
 
 
-# ===================================================================
-# async_chunk_cleanup_request
-# ===================================================================
-
-
-class TestAsyncChunkCleanupRequest:
-    def test_removes_accumulated_state(self):
-        rid = "cleanup-acc"
-        _ASYNC_ALL_CODES[rid] = [_codes(5)]
-        _ASYNC_EMITTED_FRAMES[rid] = 10
-        async_chunk_cleanup_request(rid)
-        assert rid not in _ASYNC_ALL_CODES
-        assert rid not in _ASYNC_EMITTED_FRAMES
-
-    def test_idempotent_when_state_absent(self):
-        async_chunk_cleanup_request("cleanup-absent-xyz")
-
-    def test_cleans_internal_to_external_mapping(self):
-        internal_id = "int-id-cleanup"
-        external_id = "ext-id-cleanup"
-        _ASYNC_REQ_ID_MAP[internal_id] = external_id
-        _ASYNC_ALL_CODES[external_id] = [_codes(3)]
-        _ASYNC_EMITTED_FRAMES[external_id] = 3
-
-        async_chunk_cleanup_request(internal_id)
-        assert internal_id not in _ASYNC_REQ_ID_MAP
-        assert external_id not in _ASYNC_ALL_CODES
-        assert external_id not in _ASYNC_EMITTED_FRAMES
-
-        _ASYNC_REQ_ID_MAP["int-reverse"] = "ext-reverse"
-        async_chunk_cleanup_request("ext-reverse")
-        assert "int-reverse" not in _ASYNC_REQ_ID_MAP
+def test_raon_yaml_is_sync_non_async_chunk():
+    root = Path(__file__).resolve().parents[3]
+    path = root / "vllm_omni" / "model_executor" / "stage_configs" / "raon.yaml"
+    data = yaml.safe_load(path.read_text())
+    assert data.get("async_chunk") is False
 
 
 # ===================================================================
@@ -157,15 +110,17 @@ def test_skip_path_returns_none(pooling_output):
 class TestAsyncChunkWindowedEmission:
     def test_first_chunk_waits_then_emits_at_chunk_size(self):
         rid = "windowed"
+        tm = _tm()
         req = _req(rid)
-        assert stage0_to_stage1_async_chunk(_tm(), _pooling(chunk=_codes(1)), req) is None
+        assert stage0_to_stage1_async_chunk(tm, _pooling(chunk=_codes(1)), req) is None
 
+        payload = None
         for _ in range(_CHUNK_SIZE - 1):
-            payload = stage0_to_stage1_async_chunk(_tm(), _pooling(chunk=_codes(1)), req)
+            payload = stage0_to_stage1_async_chunk(tm, _pooling(chunk=_codes(1)), req)
         assert payload is not None
         assert "codec_codes" in payload
         assert payload["left_context_size"] == 0
-        assert _ASYNC_EMITTED_FRAMES.get(rid, 0) == _CHUNK_SIZE
+        assert tm._raon_chunk_state[rid].emitted_frames == _CHUNK_SIZE
 
     def test_second_chunk_includes_left_context(self):
         rid = "windowed-ctx"
@@ -182,10 +137,11 @@ class TestAsyncChunkWindowedEmission:
 
     def test_history_retained_after_emission(self):
         rid = "windowed-hist"
+        tm = _tm()
         req = _req(rid)
         for _ in range(_CHUNK_SIZE):
-            stage0_to_stage1_async_chunk(_tm(), _pooling(chunk=_codes(1)), req)
-        all_codes = _ASYNC_ALL_CODES.get(rid, [])
+            stage0_to_stage1_async_chunk(tm, _pooling(chunk=_codes(1)), req)
+        all_codes = tm._raon_chunk_state[rid].all_codes
         total = sum(int(c.shape[0]) for c in all_codes)
         assert total == _CHUNK_SIZE
 
@@ -198,26 +154,28 @@ class TestAsyncChunkWindowedEmission:
 class TestAsyncChunkFinishFlush:
     def test_finish_emits_accumulated_data_and_cleans_state(self):
         rid = "finish-flush"
+        tm = _tm()
         req_running = _req(rid, finished=False)
         req_done = _req(rid, finished=True)
-        stage0_to_stage1_async_chunk(_tm(), _pooling(chunk=_codes(1)), req_running)
-        payload = stage0_to_stage1_async_chunk(_tm(), _pooling(chunk=_codes(2)), req_done, is_finished=True)
+        stage0_to_stage1_async_chunk(tm, _pooling(chunk=_codes(1)), req_running)
+        payload = stage0_to_stage1_async_chunk(tm, _pooling(chunk=_codes(2)), req_done, is_finished=True)
         assert payload is not None
         assert payload["finished"].item() is True
         assert payload["flush_only"] is False
-        assert rid not in _ASYNC_ALL_CODES
-        assert rid not in _ASYNC_EMITTED_FRAMES
+        assert rid not in tm._raon_chunk_state
 
     def test_finish_with_no_accumulated_data(self):
         rid = "finish-no-data"
+        tm = _tm()
         req = _req(rid, finished=True)
-        payload = stage0_to_stage1_async_chunk(_tm(), _pooling(chunk=_codes(1)), req, is_finished=True)
+        payload = stage0_to_stage1_async_chunk(tm, _pooling(chunk=_codes(1)), req, is_finished=True)
         assert payload is not None
 
     def test_finish_with_none_pooling_and_no_prior_data(self):
         rid = "finish-none"
+        tm = _tm()
         req = _req(rid, finished=True)
-        payload = stage0_to_stage1_async_chunk(_tm(), None, req, is_finished=True)
+        payload = stage0_to_stage1_async_chunk(tm, None, req, is_finished=True)
         if payload is not None:
             assert payload.get("flush_only") is True
 
@@ -241,21 +199,26 @@ def test_full_payload_key_used_when_chunk_absent():
 
 
 class TestAsyncChunkReqIdMapping:
-    def test_internal_id_mapped_and_cleanup_works(self):
+    def test_internal_id_stored_on_state_and_cleared_on_finish(self):
         internal_id = "int-id-map"
         external_id = "ext-id-map"
-        req = SimpleNamespace(
+        tm = _tm()
+        req_running = SimpleNamespace(
             external_req_id=external_id,
             request_id=internal_id,
             is_finished=lambda: False,
         )
-        stage0_to_stage1_async_chunk(_tm(), _pooling(chunk=_codes(1)), req)
-        assert _ASYNC_REQ_ID_MAP.get(internal_id) == external_id
+        stage0_to_stage1_async_chunk(tm, _pooling(chunk=_codes(1)), req_running)
+        assert external_id in tm._raon_chunk_state
+        assert tm._raon_chunk_state[external_id].internal_id == internal_id
 
-        async_chunk_cleanup_request(internal_id)
-        assert internal_id not in _ASYNC_REQ_ID_MAP
-        assert external_id not in _ASYNC_ALL_CODES
-        assert external_id not in _ASYNC_EMITTED_FRAMES
+        req_done = SimpleNamespace(
+            external_req_id=external_id,
+            request_id=internal_id,
+            is_finished=lambda: True,
+        )
+        stage0_to_stage1_async_chunk(tm, _pooling(chunk=_codes(1)), req_done, is_finished=True)
+        assert external_id not in tm._raon_chunk_state
 
 
 # ===================================================================

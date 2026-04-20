@@ -564,11 +564,6 @@ async def omni_init_app_state(
     )
     lora_modules = process_lora_modules(args.lora_modules, default_mm_loras)
 
-    # model_config must be set before tokenizer/processor init
-    if vllm_config is not None and (not hasattr(engine_client, "model_config") or engine_client.model_config is None):
-        engine_client.model_config = vllm_config.model_config
-        logger.info("Initialized model_config for AsyncOmni")
-
     # Ensure input_processor, io_processor exist for OpenAIServingModels compatibility
     if (
         not hasattr(engine_client, "input_processor")
@@ -593,10 +588,9 @@ async def omni_init_app_state(
 
                     # Initialize io_processor
                     if not hasattr(engine_client, "io_processor") or engine_client.io_processor is None:
-                        model_config = (
-                            engine_client.model_config
-                            if hasattr(engine_client, "model_config")
-                            else vllm_config.model_config
+                        # Fall back to vllm_config when engine model_config is unavailable.
+                        model_config = getattr(engine_client, "model_config", None) or (
+                            vllm_config.model_config if vllm_config is not None else None
                         )
                         io_processor_plugin = model_config.io_processor_plugin
                         renderer = getattr(engine_client, "renderer", None)
@@ -625,7 +619,10 @@ async def omni_init_app_state(
     await state.openai_serving_models.init_static_loras()
 
     state.openai_serving_render = OpenAIServingRender(
-        model_config=engine_client.model_config,
+        model_config=(
+            getattr(engine_client, "model_config", None)
+            or (vllm_config.model_config if vllm_config is not None else None)
+        ),
         renderer=engine_client.renderer,
         io_processor=engine_client.io_processor,
         model_registry=state.openai_serving_models.registry,
@@ -1956,6 +1953,18 @@ def video_response_from_request(model_name: str, req: VideoGenerationRequest) ->
     return resp
 
 
+async def decode_and_save_video_output(output: Any, file_name: str) -> str:
+    if not output.b64_json:
+        raise RuntimeError(f"Video output for {file_name} did not include b64_json content.")
+
+    try:
+        video_bytes = base64.b64decode(output.b64_json)
+    except Exception as decode_exc:
+        raise RuntimeError(f"Failed to decode generated video payload for {file_name}") from decode_exc
+
+    return await STORAGE_MANAGER.save(video_bytes, file_name)
+
+
 def _cleanup_video(video_id: str, output_path: str | None):
     try:
         if output_path is not None:
@@ -1979,12 +1988,15 @@ async def _run_video_generation_job(
     started_at = time.perf_counter()
     output_path = None
     try:
-        video_bytes, stage_durations, peak_memory_mb = await handler.generate_video_bytes(
-            request, video_id, reference_image=reference_image
-        )
+        response = await handler.generate_videos(request, video_id, reference_image=reference_image)
+        if not response.data:
+            raise RuntimeError("Video generation completed but returned no outputs.")
+
+        if (video_count := len(response.data)) > 1:
+            logger.warning("Video request %s generated %s outputs but we only expected one.", video_id, video_count)
 
         file_name = f"{video_id}.{job.file_extension}"
-        output_path = await STORAGE_MANAGER.save(video_bytes, file_name)
+        output_path = await decode_and_save_video_output(response.data[0], file_name)
         logger.info("Video request %s persisted %s output file.", video_id, output_path)
 
         await VIDEO_STORE.update_fields(
@@ -1995,8 +2007,8 @@ async def _run_video_generation_job(
                 "file_name": file_name,
                 "completed_at": int(time.time()),
                 "inference_time_s": time.perf_counter() - started_at,
-                "stage_durations": stage_durations,
-                "peak_memory_mb": peak_memory_mb,
+                "stage_durations": response.stage_durations,
+                "peak_memory_mb": response.peak_memory_mb,
             },
         )
     except Exception as exc:

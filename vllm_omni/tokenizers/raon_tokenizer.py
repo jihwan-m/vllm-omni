@@ -69,6 +69,89 @@ SPEAKER_EMBEDDING_PLACEHOLDER_TOKEN: str = SPEAKER_EMBEDDING_PLACEHOLDER.text
 SPEAKER_EMBEDDING_PLACEHOLDER_ID: int = SPEAKER_EMBEDDING_PLACEHOLDER.id
 LEGACY_SPEAKER_PAD_TOKEN: str = "<tts_pad>"
 
+
+# ---------------------------------------------------------------------------
+# Resolved special-token IDs (live-tokenizer-backed)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class RaonResolvedIds:
+    """Raon special-token IDs resolved against a live tokenizer.
+
+    This keeps serving paths from depending on stale hardcoded SpecialToken ids.
+    """
+
+    audio_start: int
+    audio_end: int
+    audio_input_placeholder: int
+    audio_output_placeholder: int
+    speaker_placeholder: int
+    audio_output_pad: int
+    audio_output_end_pad: int
+
+
+def resolve_raon_special_ids(tokenizer: Any) -> RaonResolvedIds:
+    """Resolve Raon special tokens against a live tokenizer.
+
+    Missing tokens fall back to the module defaults and log a warning so
+    tokenizer/checkpoint drift stays visible.
+    """
+
+    def _resolve(surface: str, fallback: int, label: str) -> int:
+        try:
+            tid = tokenizer.convert_tokens_to_ids(surface)
+        except Exception as exc:
+            logger.warning(
+                "Raon special token %s (%r) lookup failed (%s); falling back to hardcoded id %d",
+                label,
+                surface,
+                exc,
+                fallback,
+            )
+            return fallback
+        unk_id = getattr(tokenizer, "unk_token_id", None)
+        if tid is None or (unk_id is not None and tid == unk_id):
+            logger.warning(
+                "Raon special token %s (%r) missing from tokenizer vocab; falling back to hardcoded id %d",
+                label,
+                surface,
+                fallback,
+            )
+            return fallback
+        return int(tid)
+
+    return RaonResolvedIds(
+        audio_start=_resolve(AUDIO_START.text, AUDIO_START.id, "audio_start"),
+        audio_end=_resolve(AUDIO_END.text, AUDIO_END.id, "audio_end"),
+        audio_input_placeholder=_resolve(
+            AUDIO_INPUT_PLACEHOLDER.text,
+            AUDIO_INPUT_PLACEHOLDER.id,
+            "audio_input_placeholder",
+        ),
+        audio_output_placeholder=_resolve(
+            AUDIO_OUTPUT_PLACEHOLDER.text,
+            AUDIO_OUTPUT_PLACEHOLDER.id,
+            "audio_output_placeholder",
+        ),
+        speaker_placeholder=_resolve(
+            SPEAKER_EMBEDDING_PLACEHOLDER.text,
+            SPEAKER_EMBEDDING_PLACEHOLDER.id,
+            "speaker_placeholder",
+        ),
+        audio_output_pad=_resolve(
+            AUDIO_OUTPUT_PAD.text,
+            AUDIO_OUTPUT_PAD.id,
+            "audio_output_pad",
+        ),
+        audio_output_end_pad=_resolve(
+            AUDIO_OUTPUT_END_PAD.text,
+            AUDIO_OUTPUT_END_PAD.id,
+            "audio_output_end_pad",
+        ),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Placeholder sequences and patterns
 # ---------------------------------------------------------------------------
@@ -432,14 +515,26 @@ def inject_placeholders_into_token_ids(
 # ---------------------------------------------------------------------------
 
 
-def normalize_token_ids(prompt_token_ids: list[int]) -> list[int]:
+def normalize_token_ids(
+    prompt_token_ids: list[int],
+    *,
+    special: RaonResolvedIds,
+) -> list[int]:
     """Replace output-placeholder IDs with input-placeholder, ensuring the
-    ``[audio_start, audio_input, audio_end]`` triple is present."""
-    out_id = AUDIO_OUTPUT_PLACEHOLDER.id
-    in_id = AUDIO_INPUT_PLACEHOLDER.id
+    ``[audio_start, audio_input, audio_end]`` triple is present.
+
+    ``special`` must be a :class:`RaonResolvedIds` resolved from the live
+    tokenizer (e.g. the processor's cached ``self._ids`` or the serving
+    hook's ``self._resolved_ids``) so checkpoint-drifted IDs are respected.
+    """
+    out_id = special.audio_output_placeholder
+    in_id = special.audio_input_placeholder
+    start_id = special.audio_start
+    end_id = special.audio_end
+
     result = [in_id if tok == out_id else tok for tok in prompt_token_ids]
 
-    expected = [AUDIO_START.id, in_id, AUDIO_END.id]
+    expected = [start_id, in_id, end_id]
     if in_id in result:
         n = len(expected)
         found = any(result[i : i + n] == expected for i in range(len(result) - n + 1))
@@ -788,10 +883,12 @@ __all__ = [
     "SPEAKER_EMBEDDING_PLACEHOLDER_ID",
     "SPEAKER_EMBEDDING_PLACEHOLDER_TOKEN",
     "SpecialToken",
+    "RaonResolvedIds",
     "USER_PROMPT_MARKER",
     "align_tokenizer",
     "filter_audio_placeholder_text",
     "resolve_audio_input_token_id",
+    "resolve_raon_special_ids",
     "resolve_speaker_token_id",
     "resolve_speaker_token_text",
     "count_audio_placeholders_str",

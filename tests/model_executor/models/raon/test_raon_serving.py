@@ -1,18 +1,32 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for Raon chat template building, prompt construction, and serving hooks."""
+"""Tests for Raon serving, prompts, and tokenizer helpers."""
 
 from __future__ import annotations
 
-import pytest
+import asyncio
+import dataclasses as _dataclasses
+import logging
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
+import numpy as np
+import pytest
+from pytest_mock import MockerFixture
+
+from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
+from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
+from vllm_omni.model_executor.models.raon import serving_utils as _su
 from vllm_omni.model_executor.models.raon.serving_utils import (
     _GLOBAL_TOP_K,
     RaonServingHooks,
+    prepare_raon_tts_sampling_params,
 )
 from vllm_omni.tokenizers.raon_tokenizer import (
     AUDIO_END,
     AUDIO_INPUT_PLACEHOLDER,
+    AUDIO_OUTPUT_END_PAD,
     AUDIO_OUTPUT_OPEN_SEQ,
+    AUDIO_OUTPUT_PAD,
     AUDIO_OUTPUT_PAD_TOKEN,
     AUDIO_OUTPUT_PLACEHOLDER,
     AUDIO_PLACEHOLDER_SEQ,
@@ -25,6 +39,7 @@ from vllm_omni.tokenizers.raon_tokenizer import (
     SPEAKER_EMBEDDING_PLACEHOLDER,
     OutputMode,
     RaonChatTemplateBuilder,
+    RaonResolvedIds,
     TaskType,
     count_audio_placeholders_str,
     inject_placeholders_into_str,
@@ -34,6 +49,26 @@ from vllm_omni.tokenizers.raon_tokenizer import (
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+@pytest.fixture
+def _default_raon_ids() -> RaonResolvedIds:
+    return RaonResolvedIds(
+        audio_start=AUDIO_START.id,
+        audio_end=AUDIO_END.id,
+        audio_input_placeholder=AUDIO_INPUT_PLACEHOLDER.id,
+        audio_output_placeholder=AUDIO_OUTPUT_PLACEHOLDER.id,
+        speaker_placeholder=SPEAKER_EMBEDDING_PLACEHOLDER.id,
+        audio_output_pad=AUDIO_OUTPUT_PAD.id,
+        audio_output_end_pad=AUDIO_OUTPUT_END_PAD.id,
+    )
+
+
+def _stub_tokenizer(mapping: dict[str, int]) -> MagicMock:
+    tok = MagicMock()
+    tok.convert_tokens_to_ids.side_effect = lambda text: mapping.get(text, tok.unk_token_id)
+    tok.unk_token_id = 0
+    return tok
 
 
 # ===================================================================
@@ -95,6 +130,28 @@ def _assert_chat_frame(prompt: str) -> None:
     assert f"{IM_START.text}user" in prompt
     assert IM_END.text in prompt
     assert f"{IM_START.text}assistant\n" in prompt
+
+
+def test_prepare_raon_tts_sampling_params_copies_and_overrides_request_fields():
+    base_params = [SimpleNamespace(max_tokens=64, temperature=0.1, seed=None)]
+    request = SimpleNamespace(max_new_tokens=512, temperature=0.7, seed=1234)
+
+    class _FakeHooks:
+        def apply_task_sampling_params(self, params, *, task, request=None):
+            assert task == "tts"
+            params.temperature = request.temperature
+            params.seed = request.seed
+
+    serving = SimpleNamespace(_raon_hooks=_FakeHooks())
+
+    prepared = prepare_raon_tts_sampling_params(serving, base_params, request)
+
+    assert prepared is not base_params
+    assert prepared[0] is not base_params[0]
+    assert base_params[0].max_tokens == 64
+    assert prepared[0].max_tokens == 512
+    assert prepared[0].temperature == 0.7
+    assert prepared[0].seed == 1234
 
 
 PH = AUDIO_PLACEHOLDER_SEQ
@@ -557,23 +614,102 @@ class TestInjectPlaceholdersTokenIds:
 
 
 class TestNormalizeTokenIds:
-    def test_replaces_output_with_input(self):
+    def test_replaces_output_with_input(self, _default_raon_ids):
         ids = [1, AUDIO_OUTPUT_PLACEHOLDER.id, 3]
-        result = normalize_token_ids(ids)
+        result = normalize_token_ids(ids, special=_default_raon_ids)
         assert AUDIO_OUTPUT_PLACEHOLDER.id not in result
         assert AUDIO_INPUT_PLACEHOLDER.id in result
 
-    def test_ensures_placeholder_subsequence(self):
+    def test_ensures_placeholder_subsequence(self, _default_raon_ids):
         ids = [1, AUDIO_INPUT_PLACEHOLDER.id, 3]
-        result = normalize_token_ids(ids)
+        result = normalize_token_ids(ids, special=_default_raon_ids)
         assert AUDIO_START.id in result and AUDIO_END.id in result
 
-    def test_no_change_when_already_correct(self):
+    def test_no_change_when_already_correct(self, _default_raon_ids):
         ids = [1, AUDIO_START.id, AUDIO_INPUT_PLACEHOLDER.id, AUDIO_END.id, 3]
-        assert normalize_token_ids(ids) == ids
+        assert normalize_token_ids(ids, special=_default_raon_ids) == ids
 
-    def test_no_audio_tokens_passthrough(self):
-        assert normalize_token_ids([1, 2, 3]) == [1, 2, 3]
+    def test_no_audio_tokens_passthrough(self, _default_raon_ids):
+        assert normalize_token_ids([1, 2, 3], special=_default_raon_ids) == [1, 2, 3]
+
+
+class TestResolveRaonSpecialIds:
+    def test_default_checkpoint_matches_hardcoded(self):
+        from vllm_omni.tokenizers.raon_tokenizer import resolve_raon_special_ids
+
+        ids = resolve_raon_special_ids(
+            _stub_tokenizer(
+                {
+                    "<|audio_start|>": 151669,
+                    "<|audio_end|>": 151670,
+                    "<|audio_input_placeholder|>": 151676,
+                    "<|audio_output_placeholder|>": 151675,
+                    "<|speaker_embedding_placeholder|>": 151671,
+                    "<|audio_output_pad|>": 151677,
+                    "<|audio_output_end_pad|>": 151678,
+                }
+            )
+        )
+
+        assert ids.audio_start == 151669
+        assert ids.audio_end == 151670
+        assert ids.audio_input_placeholder == 151676
+        assert ids.audio_output_placeholder == 151675
+
+    def test_drifted_ids_are_respected(self):
+        from vllm_omni.tokenizers.raon_tokenizer import resolve_raon_special_ids
+
+        ids = resolve_raon_special_ids(
+            _stub_tokenizer(
+                {
+                    "<|audio_start|>": 200001,
+                    "<|audio_end|>": 200002,
+                    "<|audio_input_placeholder|>": 200003,
+                    "<|audio_output_placeholder|>": 200004,
+                    "<|speaker_embedding_placeholder|>": 200005,
+                    "<|audio_output_pad|>": 200006,
+                    "<|audio_output_end_pad|>": 200007,
+                }
+            )
+        )
+
+        assert ids.audio_start == 200001
+        assert ids.audio_end == 200002
+        assert ids.audio_output_placeholder == 200004
+
+    def test_missing_token_warns(self):
+        from vllm_omni.tokenizers import raon_tokenizer
+        from vllm_omni.tokenizers.raon_tokenizer import resolve_raon_special_ids
+
+        records: list[logging.LogRecord] = []
+
+        class _ListHandler(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                records.append(record)
+
+        handler = _ListHandler(level=logging.WARNING)
+        target_logger = raon_tokenizer.logger
+        prev_level = target_logger.level
+        target_logger.addHandler(handler)
+        target_logger.setLevel(logging.WARNING)
+        try:
+            resolve_raon_special_ids(
+                _stub_tokenizer(
+                    {
+                        "<|audio_end|>": 151670,
+                        "<|audio_input_placeholder|>": 151676,
+                        "<|audio_output_placeholder|>": 151675,
+                        "<|speaker_embedding_placeholder|>": 151671,
+                        "<|audio_output_pad|>": 151677,
+                        "<|audio_output_end_pad|>": 151678,
+                    }
+                )
+            )
+        finally:
+            target_logger.removeHandler(handler)
+            target_logger.setLevel(prev_level)
+
+        assert any("audio_start" in record.getMessage() for record in records)
 
 
 # ===================================================================
@@ -776,6 +912,71 @@ def _make_hooks(
 # ===================================================================
 # Serving Hooks: build_tts_prompt
 # ===================================================================
+
+
+def test_is_icl_request_public_alias():
+    request = type(
+        "Req",
+        (),
+        {
+            "task_type": "Base",
+            "x_vector_only_mode": False,
+            "ref_audio": "https://example.invalid/ref.wav",
+            "ref_text": "reference text",
+        },
+    )()
+    assert RaonServingHooks.is_icl_request(request) is True
+    assert RaonServingHooks._is_icl_request(request) is True
+
+
+def test_resolve_chat_modalities_forces_text_only_for_audio_requests():
+    hooks = _make_hooks()
+    request = SimpleNamespace(
+        modalities=["audio"],
+        _engine_output_modalities=["text", "audio"],
+    )
+    engine_prompt = {"prompt": "hi"}
+
+    output = hooks.resolve_chat_modalities(request, [engine_prompt], tokenizer=None)
+
+    assert output == ["text"]
+    assert request.modalities == ["text"]
+    assert engine_prompt["additional_information"]["output_mode"] == ["text_only"]
+    assert "force_audio_first_token" not in engine_prompt["additional_information"]
+
+
+@pytest.mark.asyncio
+async def test_apply_default_modalities_wraps_raon_chat_preprocess(monkeypatch):
+    from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
+
+    async def _orig_preprocess(self, request, *args, **kwargs):
+        return [], [{"prompt": "hi"}]
+
+    monkeypatch.setattr(OmniOpenAIServingChat, "_preprocess_chat", _orig_preprocess)
+    monkeypatch.delattr(
+        OmniOpenAIServingChat,
+        "_raon_default_modalities_applied",
+        raising=False,
+    )
+
+    RaonServingHooks.apply_default_modalities()
+
+    request = SimpleNamespace(modalities=["audio"])
+    engine_client = SimpleNamespace(
+        output_modalities=["text", "audio"],
+        get_tokenizer=AsyncMock(return_value=None),
+    )
+    serving = SimpleNamespace(
+        model_config=SimpleNamespace(hf_config=SimpleNamespace(model_type="raon")),
+        engine_client=engine_client,
+    )
+
+    _, engine_prompts = await OmniOpenAIServingChat._preprocess_chat(serving, request)
+
+    assert request.modalities == ["text"]
+    assert engine_prompts[0]["additional_information"]["output_mode"] == ["text_only"]
+    assert "force_audio_first_token" not in engine_prompts[0]["additional_information"]
+    engine_client.get_tokenizer.assert_awaited_once()
 
 
 class TestBuildTtsPrompt:
@@ -1013,3 +1214,380 @@ class TestStopTokenIdResolution:
     def test_no_hf_config_results_in_empty_stop_ids(self):
         hooks = RaonServingHooks(_StubModelConfig(hf_config=None))
         assert hooks._audio_stop_token_ids == []
+
+
+# ===================================================================
+# Long TTS helpers
+# ===================================================================
+
+
+def _build_rolling_icl_server() -> OmniOpenAIServingSpeech:
+    server = OmniOpenAIServingSpeech.__new__(OmniOpenAIServingSpeech)
+    server._tts_model_type = "raon"
+    server._diffusion_mode = False
+    server.model_config = MagicMock()
+    return server
+
+
+def _replace_raon_env(monkeypatch: pytest.MonkeyPatch, **overrides) -> None:
+    from vllm_omni.transformers_utils.configs import raon as _raon_cfg
+
+    monkeypatch.setattr(_raon_cfg, "ENV", _dataclasses.replace(_raon_cfg.ENV, **overrides))
+
+
+def _capture_chunk_reqs(server, mocker: MockerFixture, *, sr: int = 24000):
+    captured: list[dict] = []
+    # Keep each synthetic chunk long enough for the rolling ref-audio chain.
+    pcm = np.zeros(sr, dtype=np.float32)
+
+    async def _fake_collect(serving, chunk_req):
+        captured.append(
+            {
+                "input": chunk_req.input,
+                "task_type": chunk_req.task_type,
+                "voice": chunk_req.voice,
+                "ref_audio": chunk_req.ref_audio,
+                "ref_text": chunk_req.ref_text,
+                "speaker_embedding": getattr(chunk_req, "speaker_embedding", None),
+                "x_vector_only_mode": getattr(chunk_req, "x_vector_only_mode", False),
+                "_speaker_anchor_ref_audio": getattr(chunk_req, "_speaker_anchor_ref_audio", None),
+            }
+        )
+        return pcm, sr
+
+    mocker.patch.object(_su, "collect_request_pcm", _fake_collect)
+    return captured
+
+
+def _long_rolling_text(n_sentences: int = 5) -> str:
+    filler = " ".join(["word"] * 20)
+    return " ".join([f"Sentence number {i}: {filler}." for i in range(n_sentences)])
+
+
+def test_rolling_icl_gating_short_text_skips_orchestrator():
+    assert _su.should_use_rolling_icl("hello world", mode="rolling_icl", threshold=90) is False
+
+
+def test_rolling_icl_gating_long_text_activates_orchestrator():
+    long_text = " ".join(["word"] * 100)
+    assert _su.should_use_rolling_icl(long_text, mode="rolling_icl", threshold=90) is True
+
+
+def test_rolling_icl_default_mode_is_oneshot():
+    from vllm_omni.transformers_utils.configs.raon import ENV
+
+    # Long inputs still stay on oneshot unless the operator opts into rolling.
+    assert ENV.tts_long_mode == "oneshot"
+    assert _su.should_use_rolling_icl(" ".join(["word"] * 200)) is False
+
+
+def test_rolling_icl_preserves_voice_anchor(mocker: MockerFixture, monkeypatch):
+    server = _build_rolling_icl_server()
+    _replace_raon_env(
+        monkeypatch,
+        tts_long_keep_original_speaker_anchor=True,
+        tts_long_anchor_reset_every_chunks=0,
+        tts_long_max_sentences_per_chunk=1,
+        tts_long_min_ref_audio_s=0.0,
+    )
+    captured = _capture_chunk_reqs(server, mocker)
+
+    request = OpenAICreateSpeechRequest(
+        input=_long_rolling_text(3),
+        model="raon",
+        voice="vivian",
+        response_format="wav",
+    )
+    pcm, sr = asyncio.run(_su.generate_raon_long_tts_rolling_icl(server, request))
+    assert sr == 24000
+    assert pcm.size > 0
+    assert len(captured) >= 2
+    assert captured[0]["voice"] == "vivian"
+    for idx, chunk in enumerate(captured[1:], start=1):
+        assert chunk["voice"] == "vivian", f"chunk {idx}: voice drifted to {chunk['voice']!r}"
+        assert chunk["_speaker_anchor_ref_audio"] is None
+
+
+def test_rolling_icl_preserves_embedding_anchor(mocker: MockerFixture, monkeypatch):
+    server = _build_rolling_icl_server()
+    _replace_raon_env(
+        monkeypatch,
+        tts_long_keep_original_speaker_anchor=True,
+        tts_long_anchor_reset_every_chunks=0,
+        tts_long_max_sentences_per_chunk=1,
+        tts_long_min_ref_audio_s=0.0,
+    )
+    captured = _capture_chunk_reqs(server, mocker)
+
+    emb = [0.125] * 192
+    request = OpenAICreateSpeechRequest(
+        input=_long_rolling_text(3),
+        model="raon",
+        task_type="Base",
+        speaker_embedding=emb,
+        response_format="wav",
+    )
+    asyncio.run(_su.generate_raon_long_tts_rolling_icl(server, request))
+    assert len(captured) >= 2
+    for idx, chunk in enumerate(captured[1:], start=1):
+        assert chunk["speaker_embedding"] == emb, f"chunk {idx}: speaker_embedding was altered or cleared"
+        assert chunk["_speaker_anchor_ref_audio"] is None
+
+
+def test_rolling_icl_preserves_ref_audio_anchor(mocker: MockerFixture, monkeypatch):
+    server = _build_rolling_icl_server()
+    _replace_raon_env(
+        monkeypatch,
+        tts_long_keep_original_speaker_anchor=True,
+        tts_long_anchor_reset_every_chunks=0,
+        tts_long_max_sentences_per_chunk=1,
+        tts_long_min_ref_audio_s=0.0,
+    )
+
+    async def _fake_resolve(self, ref_audio_str):
+        return np.zeros(24000, dtype=np.float32).tolist(), 24000
+
+    mocker.patch.object(OmniOpenAIServingSpeech, "_resolve_ref_audio", _fake_resolve)
+    captured = _capture_chunk_reqs(server, mocker)
+
+    original_ref = "https://example.invalid/ref.wav"
+    request = OpenAICreateSpeechRequest(
+        input=_long_rolling_text(3),
+        model="raon",
+        task_type="Base",
+        ref_audio=original_ref,
+        ref_text="some reference transcript text",
+        response_format="wav",
+    )
+    asyncio.run(_su.generate_raon_long_tts_rolling_icl(server, request))
+
+    assert len(captured) >= 2
+    assert captured[0]["ref_audio"] == original_ref
+    for idx, chunk in enumerate(captured[1:], start=1):
+        assert chunk["ref_audio"] != original_ref, f"chunk {idx}: ref_audio was not rewritten to prev_pcm"
+        assert chunk["ref_audio"].startswith("data:"), f"chunk {idx}: expected PCM data URL"
+        assert chunk["_speaker_anchor_ref_audio"] == original_ref
+
+
+def test_rolling_icl_nonzero_silence_frames(mocker: MockerFixture, monkeypatch):
+    server = _build_rolling_icl_server()
+    _replace_raon_env(monkeypatch, continuation_silence_frames=2)
+    server.engine_client = MagicMock()
+    server.engine_client.get_tokenizer = AsyncMock(return_value=None)
+    server.uploaded_speakers = {}
+    server.model_config = MagicMock()
+
+    async def _fake_build_icl_tts_prompt(self, **kwargs):
+        return "stub-icl-prompt"
+
+    mocker.patch.object(_su.RaonServingHooks, "_build_icl_tts_prompt", _fake_build_icl_tts_prompt)
+
+    async def _fail_resolve(self, ref_audio_str):
+        raise RuntimeError("force skip multimodal branch")
+
+    mocker.patch.object(OmniOpenAIServingSpeech, "_resolve_ref_audio", _fail_resolve)
+    mocker.patch.object(_su.RaonServingHooks, "estimate_tts_max_tokens", return_value=512)
+    fake_hooks = _su.RaonServingHooks.__new__(_su.RaonServingHooks)
+    fake_hooks._hf_config = MagicMock()
+    server.__dict__["_raon_hooks"] = fake_hooks
+
+    chunk_req = OpenAICreateSpeechRequest(
+        input="second chunk target text",
+        model="raon",
+        task_type="Base",
+        ref_audio="data:audio/wav;base64,UklGRgAAAABXQVZFZm10IBAA",
+        ref_text="previous chunk text as reference",
+        response_format="wav",
+    )
+    prompt = asyncio.run(_su.build_raon_speech_prompt(server, chunk_req))
+    add = prompt["additional_information"]
+    assert add["continuation_silence_frames"] == [2]
+    assert add["continuation_silence_frames"] != [0]
+
+
+def test_rolling_icl_prompt_preserves_explicit_chunk_budget(mocker: MockerFixture):
+    server = _build_rolling_icl_server()
+    server.engine_client = MagicMock()
+    server.engine_client.get_tokenizer = AsyncMock(return_value=None)
+    server.uploaded_speakers = {}
+    server.model_config = MagicMock()
+
+    class _FakeHooks:
+        @staticmethod
+        def is_icl_request(request):
+            return True
+
+        async def _build_icl_tts_prompt(self, **kwargs):
+            return "stub-icl-prompt"
+
+        def estimate_tts_max_tokens(self, text):
+            return 512
+
+    async def _fail_resolve(self, ref_audio_str):
+        raise RuntimeError("force skip multimodal branch")
+
+    mocker.patch.object(OmniOpenAIServingSpeech, "_resolve_ref_audio", _fail_resolve)
+    server.__dict__["_raon_hooks"] = _FakeHooks()
+
+    chunk_req = OpenAICreateSpeechRequest(
+        input="second chunk target text",
+        model="raon",
+        task_type="Base",
+        ref_audio="data:audio/wav;base64,UklGRgAAAABXQVZFZm10IBAA",
+        ref_text="previous chunk text as reference",
+        response_format="wav",
+        max_new_tokens=2048,
+    )
+    object.__setattr__(chunk_req, "_rolling_plan_budget_explicit", True)
+
+    asyncio.run(_su.build_raon_speech_prompt(server, chunk_req))
+    assert chunk_req.max_new_tokens == 2048
+
+
+def test_rolling_icl_anchor_reset_zero_disables(mocker: MockerFixture, monkeypatch):
+    server = _build_rolling_icl_server()
+    _replace_raon_env(
+        monkeypatch,
+        tts_long_keep_original_speaker_anchor=True,
+        tts_long_anchor_reset_every_chunks=0,
+        tts_long_max_sentences_per_chunk=1,
+        tts_long_min_ref_audio_s=0.0,
+    )
+    captured = _capture_chunk_reqs(server, mocker)
+
+    request = OpenAICreateSpeechRequest(
+        input=_long_rolling_text(6),
+        model="raon",
+        voice="vivian",
+        response_format="wav",
+    )
+    asyncio.run(_su.generate_raon_long_tts_rolling_icl(server, request))
+    assert len(captured) == 6
+    for idx in range(1, 6):
+        chunk = captured[idx]
+        assert chunk["task_type"] == "Base", f"chunk {idx}: expected Base task"
+        assert isinstance(chunk["ref_audio"], str) and chunk["ref_audio"].startswith("data:")
+
+
+def test_rolling_icl_final_chunk_uses_best_of_k(mocker: MockerFixture, monkeypatch):
+    server = _build_rolling_icl_server()
+    _replace_raon_env(
+        monkeypatch,
+        tts_long_keep_original_speaker_anchor=True,
+        tts_long_anchor_reset_every_chunks=0,
+        tts_long_max_sentences_per_chunk=1,
+        tts_long_min_ref_audio_s=0.0,
+        tts_long_enable_final_best_of_k=True,
+        tts_long_final_best_of_k=5,
+        tts_long_final_best_of_k_early_exit_ratio=1.15,
+    )
+
+    collect_calls: list[str] = []
+    best_calls: list[tuple[str, dict]] = []
+
+    async def _fake_collect(serving, chunk_req):
+        collect_calls.append(chunk_req.input)
+        return np.zeros(24000, dtype=np.float32), 24000
+
+    async def _fake_best(serving, chunk_req, **kwargs):
+        best_calls.append((chunk_req.input, kwargs))
+        return (
+            np.zeros(24000, dtype=np.float32),
+            24000,
+            {
+                "generated_candidates_count": 3,
+                "early_exit_hit": True,
+                "selected_idx": 1,
+                "selected_duration_s": 1.2,
+                "expected_duration_s": 1.0,
+                "candidates": [{"duration_s": 0.8}, {"duration_s": 1.2}],
+            },
+        )
+
+    mocker.patch.object(_su, "collect_request_pcm", _fake_collect)
+    mocker.patch.object(_su, "collect_best_of_k_request_pcm", _fake_best)
+
+    request = OpenAICreateSpeechRequest(
+        input=_long_rolling_text(3),
+        model="raon",
+        voice="vivian",
+        response_format="wav",
+    )
+    asyncio.run(_su.generate_raon_long_tts_rolling_icl(server, request))
+
+    assert len(collect_calls) == 2
+    assert len(best_calls) == 1
+    assert best_calls[0][1]["k"] == 5
+    assert best_calls[0][1]["early_exit_ratio"] == 1.15
+
+
+def test_best_of_k_early_exit_and_seed_progression(mocker: MockerFixture):
+    server = _build_rolling_icl_server()
+    seen_seeds: list[int] = []
+    durations = [0.80, 1.16]
+
+    async def _fake_collect(serving, request):
+        idx = len(seen_seeds)
+        seen_seeds.append(getattr(request, "seed"))
+        sr = 24000
+        return np.zeros(int(sr * durations[idx]), dtype=np.float32), sr
+
+    mocker.patch.object(_su, "collect_request_pcm", _fake_collect)
+    mocker.patch("vllm_omni.model_executor.models.raon.serving_utils._stable_request_seed", return_value=7)
+
+    request = OpenAICreateSpeechRequest(
+        input=" ".join(["word"] * 10),
+        model="raon",
+        response_format="wav",
+    )
+    _, _, meta = asyncio.run(
+        _su.collect_best_of_k_request_pcm(
+            server,
+            request,
+            k=5,
+            target_words=10,
+            expected_wps=10.0,
+            early_exit_ratio=1.15,
+        )
+    )
+
+    assert seen_seeds == [7, 8]
+    assert meta["generated_candidates_count"] == 2
+    assert meta["early_exit_hit"] is True
+    assert meta["selected_idx"] == 1
+
+
+def test_best_of_k_falls_back_to_longest_candidate(mocker: MockerFixture):
+    server = _build_rolling_icl_server()
+    seen_seeds: list[int] = []
+    durations = [0.70, 0.90, 0.85, 1.00, 0.95]
+
+    async def _fake_collect(serving, request):
+        idx = len(seen_seeds)
+        seen_seeds.append(getattr(request, "seed"))
+        sr = 24000
+        return np.zeros(int(sr * durations[idx]), dtype=np.float32), sr
+
+    mocker.patch.object(_su, "collect_request_pcm", _fake_collect)
+    mocker.patch("vllm_omni.model_executor.models.raon.serving_utils._stable_request_seed", return_value=11)
+
+    request = OpenAICreateSpeechRequest(
+        input=" ".join(["word"] * 12),
+        model="raon",
+        response_format="wav",
+    )
+    _, _, meta = asyncio.run(
+        _su.collect_best_of_k_request_pcm(
+            server,
+            request,
+            k=5,
+            target_words=12,
+            expected_wps=8.0,
+            early_exit_ratio=1.15,
+        )
+    )
+
+    assert seen_seeds == [11, 12, 13, 14, 15]
+    assert meta["generated_candidates_count"] == 5
+    assert meta["early_exit_hit"] is False
+    assert meta["selected_idx"] == 3

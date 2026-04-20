@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -40,8 +39,6 @@ logger = init_logger(__name__)
 _CODEC_CHUNK_KEY = "codec_codes_chunk"
 _CODEC_FULL_KEY = "codec_codes"
 _MAX_CODEC_GROUPS = 32
-
-_REQUEST_CODEC_CHUNKS: dict[str, list[torch.Tensor]] = defaultdict(list)
 
 
 def _validate_stage_inputs(stage_list: list[Any], engine_input_source: list[int]) -> list[Any]:
@@ -231,33 +228,6 @@ def _resolve_request_id(stage0_output: Any, default_idx: int) -> str:
     return f"req-{default_idx}"
 
 
-def _append_request_chunk(req_id: str, chunk_time_major: torch.Tensor) -> None:
-    chunk_cpu = chunk_time_major.to("cpu").contiguous()
-    existing = _REQUEST_CODEC_CHUNKS[req_id]
-    if not existing:
-        existing.append(chunk_cpu)
-        return
-
-    prev = torch.cat(existing, dim=0)
-    prev_flat = prev.reshape(-1)
-    chunk_flat = chunk_cpu.reshape(-1)
-    if (
-        chunk_cpu.shape[0] >= prev.shape[0]
-        and chunk_cpu.shape[1] == prev.shape[1]
-        and torch.equal(chunk_cpu[: prev.shape[0]], prev)
-    ):
-        _REQUEST_CODEC_CHUNKS[req_id] = [chunk_cpu]
-        return
-    if chunk_flat.shape[0] >= prev_flat.shape[0] and torch.equal(chunk_flat[: prev_flat.shape[0]], prev_flat):
-        _REQUEST_CODEC_CHUNKS[req_id] = [chunk_cpu]
-        return
-
-    if prev_flat.shape[0] >= chunk_flat.shape[0] and torch.equal(prev_flat[: chunk_flat.shape[0]], chunk_flat):
-        return
-
-    existing.append(chunk_cpu)
-
-
 def _collapse_cumulative_prefix_snapshot(payload_time_major: torch.Tensor) -> torch.Tensor:
     """Collapse [c1] + [c1,c2] + ... style snapshots to the final window."""
     if payload_time_major.ndim != 2 or payload_time_major.shape[0] < 3:
@@ -343,29 +313,22 @@ def stage0_to_stage1(
         first_output = outputs[0] if outputs else None
         req_id = _resolve_request_id(stage0_output, out_idx)
 
-        mm_output = _resolve_mm_output(stage0_output, first_output)
-        full_time_major: torch.Tensor | None = None
-        if isinstance(mm_output, dict):
-            chunk_payload = mm_output.get(_CODEC_CHUNK_KEY)
-            if chunk_payload is not None:
-                time_major = _codec_payload_to_time_major(chunk_payload)
-                if time_major is not None and time_major.numel() > 0:
-                    _append_request_chunk(req_id, time_major)
-
-            full_payload = mm_output.get(_CODEC_FULL_KEY)
-            if full_payload is not None:
-                full_time_major = _codec_payload_to_time_major(full_payload)
-
         if not _is_stage0_request_finished(stage0_output, first_output):
             continue
 
-        buffered_chunks = _REQUEST_CODEC_CHUNKS.pop(req_id, [])
-        if len(buffered_chunks) > 0:
-            all_codes_time_major = torch.cat(buffered_chunks, dim=0)
-        else:
-            if not (isinstance(full_time_major, torch.Tensor) and full_time_major.numel() > 0):
-                continue
-            all_codes_time_major = full_time_major
+        mm_output = _resolve_mm_output(stage0_output, first_output)
+        all_codes_time_major: torch.Tensor | None = None
+        if isinstance(mm_output, dict):
+            full_payload = mm_output.get(_CODEC_FULL_KEY)
+            if full_payload is not None:
+                all_codes_time_major = _codec_payload_to_time_major(full_payload)
+            if all_codes_time_major is None or all_codes_time_major.numel() == 0:
+                chunk_payload = mm_output.get(_CODEC_CHUNK_KEY)
+                if chunk_payload is not None:
+                    all_codes_time_major = _codec_payload_to_time_major(chunk_payload)
+
+        if not (isinstance(all_codes_time_major, torch.Tensor) and all_codes_time_major.numel() > 0):
+            continue
         all_codes_time_major = _collapse_cumulative_prefix_snapshot(all_codes_time_major)
         all_codes_time_major = collapse_exact_repeated_codec_snapshot(all_codes_time_major)
         all_flattened_codes = _flatten_codec_codes(all_codes_time_major)
@@ -373,9 +336,8 @@ def stage0_to_stage1(
             continue
 
         logger.info(
-            "[raon stage0_to_stage1] req_id=%s chunks=%d, time_major_shape=%s, flattened_len=%d",
+            "[raon stage0_to_stage1] req_id=%s time_major_shape=%s, flattened_len=%d",
             req_id,
-            len(buffered_chunks),
             tuple(all_codes_time_major.shape),
             len(all_flattened_codes),
         )

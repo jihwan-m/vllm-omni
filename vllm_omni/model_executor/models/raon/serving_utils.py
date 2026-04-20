@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import base64
+import copy
 import hashlib
 import io
 import re
+import time
 from collections.abc import MutableMapping, Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import numpy as np
 import soundfile as sf
@@ -22,13 +24,20 @@ from vllm_omni.model_executor.models.raon.raon_audio_encoder import (
 )
 from vllm_omni.tokenizers.raon_tokenizer import (
     AUDIO_END,
+    AUDIO_INPUT_PLACEHOLDER,
+    AUDIO_OUTPUT_END_PAD,
+    AUDIO_OUTPUT_PAD,
     AUDIO_OUTPUT_PAD_TOKEN,
+    AUDIO_OUTPUT_PLACEHOLDER,
+    AUDIO_START,
     AUDIO_START_TOKEN,
     IM_END,
     SPEAKER_EMBEDDING_PLACEHOLDER,
     RaonChatTemplateBuilder,
+    RaonResolvedIds,
     TaskType,
     normalize_token_ids,
+    resolve_raon_special_ids,
 )
 from vllm_omni.transformers_utils.configs.raon import (
     AUDIO_SAMPLE_RATE,
@@ -42,6 +51,17 @@ _DEFAULT_SPEAKER_NPY = Path(__file__).resolve().parent / "assets" / "default_spe
 
 # Lazily-cached default speaker embedding (192-dim ECAPA x-vector).
 _default_speaker_embedding: torch.Tensor | None = None
+
+
+_DEFAULT_RESOLVED_IDS = RaonResolvedIds(
+    audio_start=AUDIO_START.id,
+    audio_end=AUDIO_END.id,
+    audio_input_placeholder=AUDIO_INPUT_PLACEHOLDER.id,
+    audio_output_placeholder=AUDIO_OUTPUT_PLACEHOLDER.id,
+    speaker_placeholder=SPEAKER_EMBEDDING_PLACEHOLDER.id,
+    audio_output_pad=AUDIO_OUTPUT_PAD.id,
+    audio_output_end_pad=AUDIO_OUTPUT_END_PAD.id,
+)
 
 
 def decode_audio_data_url(data_url: str) -> tuple[np.ndarray, int]:
@@ -348,7 +368,16 @@ class RaonServingHooks:
 
         prompt_token_ids = engine_prompt.get("prompt_token_ids")
         if isinstance(prompt_token_ids, list) and all(isinstance(t, int) for t in prompt_token_ids):
-            engine_prompt["prompt_token_ids"] = normalize_token_ids(prompt_token_ids)
+            special = _DEFAULT_RESOLVED_IDS
+            if tokenizer is not None:
+                try:
+                    special = resolve_raon_special_ids(tokenizer)
+                except Exception:
+                    pass
+            engine_prompt["prompt_token_ids"] = normalize_token_ids(
+                prompt_token_ids,
+                special=special,
+            )
 
     async def build_tts_prompt(
         self,
@@ -426,9 +455,14 @@ class RaonServingHooks:
         tokenizer: Any,
     ) -> list[str]:
         requested = getattr(request, "modalities", None)
-        default = self.get_default_chat_modalities() if requested is None else None
+        if requested is not None and set(requested) != {"text"}:
+            logger.info(
+                "Raon chat: overriding client modalities=%s to ['text']; use /v1/audio/speech for speech synthesis.",
+                list(requested),
+            )
+        default = self.get_default_chat_modalities()
         normalized = canonicalize_modalities(
-            requested_modalities=requested,
+            requested_modalities=None,
             default_modalities=default or getattr(request, "_engine_output_modalities", None),
         )
         output_modalities = normalized or getattr(request, "_engine_output_modalities", ["text"])
@@ -510,7 +544,7 @@ class RaonServingHooks:
         return prompt
 
     @staticmethod
-    def _is_icl_request(request: Any) -> bool:
+    def is_icl_request(request: Any) -> bool:
         """Return True if request is an ICL voice cloning request."""
         task_type = getattr(request, "task_type", None)
         if task_type is None:
@@ -525,6 +559,8 @@ class RaonServingHooks:
         ref_audio = getattr(request, "ref_audio", None)
         ref_text = getattr(request, "ref_text", None)
         return bool(isinstance(ref_audio, str) and ref_audio.strip() and isinstance(ref_text, str) and ref_text.strip())
+
+    _is_icl_request = is_icl_request
 
     @staticmethod
     def validate_request(request: Any) -> str | None:
@@ -586,3 +622,640 @@ class RaonServingHooks:
         if wav_np.ndim > 1:
             wav_np = np.mean(wav_np, axis=-1)
         return wav_np, int(sr)
+
+    @classmethod
+    def apply_default_modalities(cls) -> None:
+        from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
+
+        if getattr(OmniOpenAIServingChat, "_raon_default_modalities_applied", False):
+            return
+
+        orig_preprocess = OmniOpenAIServingChat._preprocess_chat
+
+        async def _preprocess_chat(self, request, *args, **kwargs):
+            conversation, engine_prompts = await orig_preprocess(self, request, *args, **kwargs)
+            hf = getattr(self.model_config, "hf_config", None)
+            if getattr(hf, "model_type", None) == "raon":
+                request._engine_output_modalities = self.engine_client.output_modalities
+                tokenizer = await self.engine_client.get_tokenizer()
+                cls(self.model_config).resolve_chat_modalities(request, engine_prompts, tokenizer)
+            return conversation, engine_prompts
+
+        OmniOpenAIServingChat._preprocess_chat = _preprocess_chat
+        OmniOpenAIServingChat._raon_default_modalities_applied = True
+
+
+def _get_raon_serving_hooks(serving: Any) -> RaonServingHooks:
+    hooks = getattr(serving, "_raon_hooks", None)
+    if hooks is not None:
+        return hooks
+    return RaonServingHooks(serving.model_config)
+
+
+def prepare_raon_tts_sampling_params(
+    serving: Any,
+    sampling_params_list: list[Any],
+    request: Any,
+) -> list[Any]:
+    if not sampling_params_list:
+        return sampling_params_list
+
+    prepared = copy.deepcopy(sampling_params_list)
+    hooks = _get_raon_serving_hooks(serving)
+    hooks.apply_task_sampling_params(
+        prepared[0],
+        task="tts",
+        request=request,
+    )
+    if getattr(request, "max_new_tokens", None) is not None:
+        prepared[0].max_tokens = request.max_new_tokens
+    return prepared
+
+
+async def build_raon_speech_prompt(serving: Any, request: Any) -> dict[str, Any]:
+    """Build the Raon speech prompt and serving metadata.
+
+    Applies speaker selection, ICL-specific additional_information, and the
+    serving-side max_new_tokens heuristic used by /v1/audio/speech.
+    """
+    hooks = _get_raon_serving_hooks(serving)
+    additional_info: dict[str, Any] = {
+        "force_audio_first_token": [True],
+        "output_mode": ["audio_only"],
+    }
+
+    has_speaker = False
+    is_icl = hooks.is_icl_request(request)
+
+    if request.voice and request.voice.lower() in serving.uploaded_speakers and request.ref_audio is None:
+        speaker_info = serving.uploaded_speakers[request.voice.lower()]
+        if speaker_info.get("embedding_source") == "direct":
+            stored_emb = speaker_info.get("embedding_tensor")
+            if stored_emb is not None:
+                additional_info["cached_spk_embedding"] = [torch.tensor(stored_emb, dtype=torch.float32).tolist()]
+                has_speaker = True
+            else:
+                logger.warning("Uploaded voice '%s' has no stored embedding", request.voice)
+        else:
+            file_path = speaker_info.get("file_path")
+            if file_path and Path(file_path).exists():
+                with open(file_path, "rb") as f:
+                    audio_b64 = base64.b64encode(f.read()).decode("utf-8")
+                mime_type = speaker_info.get("mime_type", "audio/wav")
+                additional_info["speaker_ref_audio"] = [f"data:{mime_type};base64,{audio_b64}"]
+                has_speaker = True
+            else:
+                logger.warning("Uploaded voice '%s' audio file missing at %s", request.voice, file_path)
+    elif request.speaker_embedding is not None:
+        additional_info["cached_spk_embedding"] = [
+            torch.tensor(request.speaker_embedding, dtype=torch.float32).tolist()
+        ]
+        has_speaker = True
+    elif request.ref_audio is not None and isinstance(request.ref_audio, str):
+        anchor_override = getattr(request, "_speaker_anchor_ref_audio", None)
+        if isinstance(anchor_override, str) and anchor_override.strip():
+            additional_info["speaker_ref_audio"] = [anchor_override]
+        else:
+            additional_info["speaker_ref_audio"] = [request.ref_audio]
+        has_speaker = True
+
+    if not has_speaker and not is_icl:
+        default_emb = get_default_speaker_embedding()
+        if default_emb is not None:
+            additional_info["cached_spk_embedding"] = [default_emb.tolist()]
+            has_speaker = True
+
+    if is_icl:
+        from vllm_omni.transformers_utils.configs.raon import ENV as _RAON_ENV_ICL
+
+        additional_info["icl_mode"] = [True]
+        additional_info["source_ref_text"] = [str(request.ref_text or "")]
+        additional_info["continuation_silence_frames"] = [int(_RAON_ENV_ICL.continuation_silence_frames)]
+        prompt_text = await hooks._build_icl_tts_prompt(
+            target_text=request.input,
+            ref_text=request.ref_text,
+            prepend_speaker_token=has_speaker,
+            engine_client=serving.engine_client,
+        )
+        prompt: dict[str, Any] = {"prompt": prompt_text}
+        if request.ref_audio and isinstance(request.ref_audio, str):
+            try:
+                ref_np, ref_sr = await serving._resolve_ref_audio(request.ref_audio)
+                ref_np = np.asarray(ref_np, dtype=np.float32)
+                prompt["multi_modal_data"] = {"audio": [(ref_np, ref_sr)]}
+            except Exception:
+                logger.warning("Failed to resolve ref_audio for ICL prefill", exc_info=True)
+    else:
+        prompt_text = await hooks.build_tts_prompt(
+            request.input,
+            prepend_speaker_token=has_speaker,
+            engine_client=serving.engine_client,
+        )
+        prompt = {"prompt": prompt_text}
+
+    heuristic_max = hooks.estimate_tts_max_tokens(request.input)
+    preserve_explicit_max_tokens = bool(getattr(request, "_rolling_plan_budget_explicit", False))
+    if request.max_new_tokens is None:
+        request.max_new_tokens = heuristic_max
+    elif not preserve_explicit_max_tokens and int(request.max_new_tokens) > heuristic_max:
+        logger.info(
+            "Raon TTS: clamping client max_new_tokens=%d to heuristic cap %d for input_len=%d",
+            int(request.max_new_tokens),
+            heuristic_max,
+            len(request.input),
+        )
+        request.max_new_tokens = heuristic_max
+
+    prompt["additional_information"] = additional_info
+    return prompt
+
+
+async def collect_request_pcm(serving: Any, request: Any) -> tuple[np.ndarray, int]:
+    """Run one unary speech request and return final PCM + sample rate."""
+    request_id, generator, _ = await serving._prepare_speech_generation(request)
+
+    final_output = None
+    async for res in generator:
+        final_output = res
+
+    if final_output is None:
+        raise ValueError("No output generated from the model.")
+
+    audio_output, audio_key = serving._extract_audio_output(final_output)
+    if audio_key is None:
+        raise ValueError("TTS model did not produce audio output.")
+
+    audio_tensor = audio_output[audio_key]
+    sr_raw = audio_output.get("sr", 24000)
+    sr_val = sr_raw[-1] if isinstance(sr_raw, list) and sr_raw else sr_raw
+    sample_rate = sr_val.item() if hasattr(sr_val, "item") else int(sr_val)
+
+    if isinstance(audio_tensor, list):
+        async_chunk = bool(getattr(serving.engine_client.model_config, "async_chunk", False))
+        if async_chunk:
+            non_empty_chunks = [candidate for candidate in audio_tensor if candidate.numel() > 0]
+            audio_tensor = torch.cat(non_empty_chunks, dim=-1) if non_empty_chunks else np.zeros((0,), dtype=np.float32)
+        else:
+            audio_history = audio_tensor
+            audio_tensor = np.zeros((0,), dtype=np.float32)
+            for candidate in reversed(audio_history):
+                if candidate.numel() > 0:
+                    audio_tensor = candidate
+                    break
+    if hasattr(audio_tensor, "float"):
+        audio_tensor = audio_tensor.float().detach().cpu().numpy()
+
+    if audio_tensor.ndim > 1:
+        audio_tensor = audio_tensor.squeeze()
+    return audio_tensor, int(sample_rate)
+
+
+async def collect_best_of_k_request_pcm(
+    serving: Any,
+    request: Any,
+    *,
+    k: int,
+    score_mode: str = "duration",
+    target_words: int | None = None,
+    expected_wps: float | None = None,
+    early_exit_ratio: float | None = None,
+) -> tuple[np.ndarray, int, dict[str, Any]]:
+    """Generate up to ``k`` Raon candidates and keep the best one.
+
+    Candidates advance the deterministic seed one step at a time and can exit
+    early once duration clears the expected threshold.
+    """
+    k_int = max(1, int(k))
+
+    base_seed_opt = _stable_request_seed(
+        text=request.input or "",
+        task_type=getattr(request, "task_type", None),
+        ref_audio=getattr(request, "ref_audio", None),
+        base_seed=0,
+    )
+    base_seed = int(base_seed_opt) if base_seed_opt is not None else 0
+
+    expected_duration_s: float | None = None
+    if target_words is not None and expected_wps is not None and float(expected_wps) > 0 and int(target_words) > 0:
+        expected_duration_s = float(target_words) / float(expected_wps)
+
+    exit_ratio = float(early_exit_ratio) if early_exit_ratio is not None else 0.0
+    early_exit_threshold_s: float | None = (
+        expected_duration_s * exit_ratio if (expected_duration_s is not None and exit_ratio > 0) else None
+    )
+
+    mode = (score_mode or "duration").strip().lower()
+    if mode not in ("duration", "duration_then_length"):
+        logger.info(
+            "Raon best-of-k score_mode=%r not implemented; falling back to 'duration'.",
+            score_mode,
+        )
+        mode = "duration"
+
+    candidates_meta: list[dict[str, Any]] = []
+    results: list[tuple[np.ndarray, int]] = []
+    early_exit_hit = False
+
+    for idx in range(k_int):
+        cand = request.model_copy(deep=True)
+        if getattr(request, "_rolling_plan_budget_explicit", False):
+            object.__setattr__(cand, "_rolling_plan_budget_explicit", True)
+        object.__setattr__(cand, "seed", int((base_seed + idx) & 0x7FFFFFFF))
+
+        pcm, sr = await collect_request_pcm(serving, cand)
+        duration_s = float(np.asarray(pcm).size) / float(max(1, int(sr)))
+        results.append((pcm, sr))
+        candidates_meta.append({"idx": int(idx), "duration_s": duration_s, "sample_rate": int(sr)})
+
+        if early_exit_threshold_s is not None and duration_s >= early_exit_threshold_s:
+            early_exit_hit = True
+            break
+
+    if mode == "duration_then_length":
+        selected_idx = max(
+            range(len(results)),
+            key=lambda i: (
+                candidates_meta[i]["duration_s"],
+                int(np.asarray(results[i][0]).size),
+                -i,
+            ),
+        )
+    else:
+        selected_idx = max(
+            range(len(results)),
+            key=lambda i: (candidates_meta[i]["duration_s"], -i),
+        )
+
+    best_pcm, best_sr = results[selected_idx]
+    selection_meta: dict[str, Any] = {
+        "k_max": int(k_int),
+        "generated_candidates_count": int(len(results)),
+        "early_exit_hit": bool(early_exit_hit),
+        "early_exit_threshold_s": early_exit_threshold_s,
+        "score_mode": mode,
+        "candidates": candidates_meta,
+        "selected_idx": int(selected_idx),
+        "selected_duration_s": float(candidates_meta[selected_idx]["duration_s"]),
+        "expected_duration_s": expected_duration_s,
+    }
+    return np.asarray(best_pcm, dtype=np.float32), int(best_sr), selection_meta
+
+
+async def generate_raon_long_tts_rolling_icl(serving: Any, request: Any) -> tuple[np.ndarray, int]:
+    """Run long-form Raon TTS with sentence-chunked rolling ICL.
+
+    Later chunks feed the previous PCM back as ref_audio/ref_text, preserve the
+    original speaker anchor when configured, and optionally use final best-of-k.
+    """
+    text = request.input or ""
+    sentences = split_text_into_sentences(text)
+    if not sentences:
+        raise ValueError("rolling_icl received empty/unsegmentable input")
+    raw_chunks = build_sentence_chunks(
+        sentences,
+        max_sentences_per_chunk=int(ENV.tts_long_max_sentences_per_chunk),
+    )
+
+    plans: list[ChunkPlan] = [ChunkPlan(sentences=tuple(rc), boundary_kind="sentence_end") for rc in raw_chunks]
+
+    anchor_reset_every = max(0, int(ENV.tts_long_anchor_reset_every_chunks))
+    keep_speaker_anchor = bool(ENV.tts_long_keep_original_speaker_anchor)
+    min_ref_audio_s = float(ENV.tts_long_min_ref_audio_s)
+
+    original_ref_audio_anchor: str | None = None
+    if (
+        keep_speaker_anchor
+        and isinstance(request.ref_audio, str)
+        and request.ref_audio.strip()
+        and not request.voice
+        and getattr(request, "speaker_embedding", None) is None
+    ):
+        original_ref_audio_anchor = request.ref_audio
+        try:
+            _anchor_wav, _anchor_sr = await serving._resolve_ref_audio(original_ref_audio_anchor)
+            logger.info(
+                "Raon rolling-ICL: cached speaker anchor from ref_audio (sr=%d samples=%d)",
+                int(_anchor_sr),
+                int(len(_anchor_wav)),
+            )
+        except Exception as _anchor_err:
+            logger.warning(
+                "Raon rolling-ICL: speaker anchor probe failed: %s",
+                _anchor_err,
+            )
+
+    total_budget = request.max_new_tokens
+    per_plan_budget: list[int | None] = [None] * len(plans)
+    if total_budget is not None and total_budget > 0:
+        if total_budget < len(plans):
+            logger.info(
+                "Raon rolling-ICL fallback: max_new_tokens=%d < plans=%d; "
+                "routing to one-shot path to honour the explicit cap.",
+                total_budget,
+                len(plans),
+            )
+            return await collect_request_pcm(serving, request)
+        plan_word_counts = [count_words(p.text) for p in plans]
+        total_words = max(1, sum(plan_word_counts))
+        remaining = int(total_budget)
+        for i, wc in enumerate(plan_word_counts):
+            if i == len(plans) - 1:
+                per_plan_budget[i] = max(1, remaining)
+            else:
+                share = max(1, int(total_budget * wc / total_words))
+                share = min(share, remaining - (len(plans) - i - 1))
+                per_plan_budget[i] = share
+                remaining -= share
+
+    logger.info(
+        "Raon rolling-ICL: words=%d raw_chunks=%d plans=%d anchor_every=%d ref_mode=%s",
+        len(text.split()),
+        len(raw_chunks),
+        len(plans),
+        anchor_reset_every,
+        ENV.tts_long_ref_text_mode,
+    )
+
+    segments: list[np.ndarray] = []
+    sample_rate: int = 24000
+    prev_pcm: np.ndarray | None = None
+    prev_sr: int | None = None
+
+    for chunk_idx, plan in enumerate(plans):
+        chunk_text = plan.text
+        chunk_req = request.model_copy(deep=True)
+        chunk_req.input = chunk_text
+        chunk_req.stream = False
+
+        chunk_req.max_new_tokens = per_plan_budget[chunk_idx]
+        if chunk_req.max_new_tokens is not None:
+            object.__setattr__(chunk_req, "_rolling_plan_budget_explicit", True)
+
+        is_anchor_reset = anchor_reset_every > 0 and chunk_idx > 0 and (chunk_idx % anchor_reset_every == 0)
+        if chunk_idx == 0 or is_anchor_reset or prev_pcm is None:
+            used_task_type = chunk_req.task_type or request.task_type or "<original>"
+            ref_text_len = len(chunk_req.ref_text or "")
+            speaker_source = "original_anchor"
+        else:
+            prev_plan = plans[chunk_idx - 1]
+            ref_text = get_ref_text_for_next_chunk(prev_plan.text, mode=ENV.tts_long_ref_text_mode).strip()
+            ref_audio_url = encode_pcm_to_wav_data_url(prev_pcm, prev_sr or sample_rate)
+            chunk_req.task_type = "Base"
+            chunk_req.ref_audio = ref_audio_url
+            chunk_req.ref_text = ref_text or "..."
+            if not keep_speaker_anchor:
+                chunk_req.voice = None
+                chunk_req.x_vector_only_mode = False
+                chunk_req.speaker_embedding = None
+            elif original_ref_audio_anchor is not None:
+                object.__setattr__(chunk_req, "_speaker_anchor_ref_audio", original_ref_audio_anchor)
+            used_task_type = "Base"
+            ref_text_len = len(chunk_req.ref_text or "")
+            speaker_source = "original_anchor" if keep_speaker_anchor else "prev_pcm"
+
+        t0 = time.perf_counter()
+        is_final_chunk = chunk_idx == len(plans) - 1
+        if is_final_chunk and ENV.tts_long_enable_final_best_of_k and int(ENV.tts_long_final_best_of_k) >= 2:
+            k = int(ENV.tts_long_final_best_of_k)
+            target_words_final = count_words(chunk_text)
+            chunk_pcm, chunk_sr, best_meta = await collect_best_of_k_request_pcm(
+                serving,
+                chunk_req,
+                k=k,
+                score_mode=str(ENV.tts_long_final_best_of_k_score_mode),
+                target_words=target_words_final,
+                expected_wps=float(ENV.tts_long_final_best_of_k_expected_wps),
+                early_exit_ratio=float(ENV.tts_long_final_best_of_k_early_exit_ratio),
+            )
+            logger.debug(
+                "Raon rolling-ICL final best-of-%d: generated=%d early_exit_hit=%s "
+                "selected_idx=%d selected_duration_s=%.2f expected_duration_s=%s candidates=%s",
+                k,
+                best_meta["generated_candidates_count"],
+                best_meta["early_exit_hit"],
+                best_meta["selected_idx"],
+                best_meta["selected_duration_s"],
+                None if best_meta["expected_duration_s"] is None else round(float(best_meta["expected_duration_s"]), 2),
+                [round(c["duration_s"], 2) for c in best_meta["candidates"]],
+            )
+        else:
+            chunk_pcm, chunk_sr = await collect_request_pcm(serving, chunk_req)
+        duration_s = chunk_pcm.size / float(max(1, chunk_sr))
+        elapsed = time.perf_counter() - t0
+        target_words_log = count_words(chunk_text)
+        ref_words_log = count_words(chunk_req.ref_text or "") if used_task_type == "Base" else 0
+
+        logger.debug(
+            "Raon rolling-ICL chunk %d/%d: sentences=%d boundary=%s ref_text_len=%d "
+            "ref_words=%d target_words=%d task=%s speaker_source=%s max_new_tokens=%s "
+            "duration_s=%.2f elapsed_s=%.2f",
+            chunk_idx,
+            len(plans) - 1,
+            len(plan.sentences),
+            plan.boundary_kind,
+            ref_text_len,
+            ref_words_log,
+            target_words_log,
+            used_task_type,
+            speaker_source,
+            chunk_req.max_new_tokens,
+            duration_s,
+            elapsed,
+        )
+
+        raw_pcm = np.asarray(chunk_pcm, dtype=np.float32)
+        trimmed = trim_leading_trailing_silence(raw_pcm, int(chunk_sr))
+        segments.append(trimmed)
+        sample_rate = int(chunk_sr)
+
+        if duration_s < min_ref_audio_s:
+            logger.warning(
+                "Raon rolling-ICL: chunk %d duration=%.2fs < min_ref=%.2fs; "
+                "dropping from ref_audio chain (next chunk uses original path).",
+                chunk_idx,
+                duration_s,
+                min_ref_audio_s,
+            )
+            prev_pcm = None
+            prev_sr = None
+        else:
+            prev_pcm = raw_pcm
+            prev_sr = sample_rate
+
+    pauses_ms = [pause_ms_for_boundary(plans[k].boundary_kind) for k in range(len(plans) - 1)]
+    logger.info("Raon rolling-ICL complete: plans=%d", len(plans))
+    final_pcm = concat_audio_segments(segments, pauses_ms, sample_rate)
+    return final_pcm, sample_rate
+
+
+# Rolling-ICL helpers.
+# Long-form Raon TTS can chunk text and feed prior PCM back as ref_audio when
+# ENV.tts_long_mode == "rolling_icl".
+
+
+def should_use_rolling_icl(
+    text: str,
+    *,
+    mode: str | None = None,
+    threshold: int | None = None,
+) -> bool:
+    """Return whether rolling-ICL should handle this text.
+
+    ``mode`` and ``threshold`` override the frozen ENV snapshot for tests.
+    """
+    effective_mode = mode if mode is not None else ENV.tts_long_mode
+    if effective_mode != "rolling_icl":
+        return False
+    effective_threshold = int(threshold) if threshold is not None else int(ENV.tts_long_word_threshold)
+    n_words = len((text or "").split())
+    return n_words >= effective_threshold
+
+
+_SENTENCE_BOUNDARY = re.compile(r"(?<=[.!?])\s+")
+_MIN_WORDS_PER_SENTENCE = 3
+
+
+def split_text_into_sentences(text: str) -> list[str]:
+    """Split text conservatively and merge tiny fragments."""
+    text = (text or "").strip()
+    if not text:
+        return []
+    raw = _SENTENCE_BOUNDARY.split(text)
+    sentences = [s.strip() for s in raw if s and s.strip()]
+    merged: list[str] = []
+    for s in sentences:
+        if merged and len(s.split()) < _MIN_WORDS_PER_SENTENCE:
+            merged[-1] = f"{merged[-1]} {s}".strip()
+        else:
+            merged.append(s)
+    return merged
+
+
+def build_sentence_chunks(
+    sentences: list[str],
+    *,
+    max_sentences_per_chunk: int = 2,
+) -> list[list[str]]:
+    """Chunk sentences and merge tiny trailing tails into the previous chunk."""
+    if not sentences:
+        return []
+    step = max(1, int(max_sentences_per_chunk))
+    chunks: list[list[str]] = [sentences[i : i + step] for i in range(0, len(sentences), step)]
+    if len(chunks) >= 2 and len(chunks[-1]) == 1:
+        tail_words = len(chunks[-1][0].split())
+        if tail_words < _MIN_WORDS_PER_SENTENCE * 2:
+            chunks[-2] = chunks[-2] + chunks[-1]
+            chunks.pop()
+    return chunks
+
+
+class ChunkPlan(NamedTuple):
+    """Rolling-ICL chunk plus downstream boundary kind.
+
+    Current planning emits sentence_end boundaries, while other kinds remain
+    reserved for pause/ref-text handling.
+    """
+
+    sentences: tuple[str, ...]
+    boundary_kind: str
+
+    @property
+    def text(self) -> str:
+        return " ".join(self.sentences)
+
+
+def pause_ms_for_boundary(kind: str) -> int:
+    """Return the stitch pause for a chunk boundary."""
+    if kind == "clause_split":
+        return int(ENV.tts_long_pause_ms_clause)
+    return int(ENV.tts_long_pause_ms_period)
+
+
+_CLAUSE_SPLIT_RE = re.compile(r"(?<=[,;:])\s+")
+
+
+def get_ref_text_for_next_chunk(prev_chunk_text: str, mode: str | None = None) -> str:
+    """Pick the ref_text fed into the next rolling chunk.
+
+    ``mode`` mirrors ENV.tts_long_ref_text_mode and may select the full chunk,
+    the last sentence, or the last clause.
+    """
+    effective_mode = (mode or ENV.tts_long_ref_text_mode or "last_sentence").strip().lower()
+    text = (prev_chunk_text or "").strip()
+    if not text:
+        return ""
+    if effective_mode == "full_prev_chunk":
+        return text
+    if effective_mode == "last_sentence":
+        sents = split_text_into_sentences(text)
+        return sents[-1] if sents else text
+    if effective_mode == "last_clause":
+        parts = _CLAUSE_SPLIT_RE.split(text)
+        parts = [p.strip() for p in parts if p.strip()]
+        return parts[-1] if parts else text
+    # Unknown mode: fall through to safe default (last_sentence).
+    sents = split_text_into_sentences(text)
+    return sents[-1] if sents else text
+
+
+def infer_pause_ms_from_chunk(chunk_text: str) -> int:
+    """Compatibility shim for tests; prefer pause_ms_for_boundary()."""
+    text = (chunk_text or "").rstrip()
+    if text.endswith((".", "!", "?", "。", "！", "？")):
+        return int(ENV.tts_long_pause_ms_period)
+    return int(ENV.tts_long_pause_ms_clause)
+
+
+def trim_leading_trailing_silence(
+    audio: np.ndarray,
+    sample_rate: int,
+    *,
+    threshold_dbfs: float = -45.0,
+    max_trim_s: float = 0.25,
+) -> np.ndarray:
+    if not ENV.tts_long_enable_stitch_trim:
+        return audio
+    if audio.size == 0:
+        return audio
+    x = np.asarray(audio, dtype=np.float32)
+    threshold = 10.0 ** (float(threshold_dbfs) / 20.0)
+    nonzero = np.where(np.abs(x) > threshold)[0]
+    if nonzero.size == 0:
+        return x
+    start = int(nonzero[0])
+    end = int(nonzero[-1]) + 1
+    max_trim = int(float(max_trim_s) * float(sample_rate))
+    start = min(start, max_trim)
+    end = max(end, x.size - max_trim)
+    return x[start:end]
+
+
+def concat_audio_segments(
+    segments: list[np.ndarray],
+    pauses_ms: list[int],
+    sample_rate: int,
+) -> np.ndarray:
+    if not segments:
+        return np.zeros(0, dtype=np.float32)
+    parts: list[np.ndarray] = []
+    for i, seg in enumerate(segments):
+        parts.append(np.asarray(seg, dtype=np.float32).reshape(-1))
+        if i < len(segments) - 1:
+            pause_ms = int(pauses_ms[i]) if i < len(pauses_ms) else 0
+            if pause_ms > 0:
+                n_silence = int(sample_rate * pause_ms / 1000.0)
+                if n_silence > 0:
+                    parts.append(np.zeros(n_silence, dtype=np.float32))
+    return np.concatenate(parts) if parts else np.zeros(0, dtype=np.float32)
+
+
+def encode_pcm_to_wav_data_url(pcm: np.ndarray, sample_rate: int) -> str:
+    """Encode mono PCM as a WAV data URL."""
+    buf = io.BytesIO()
+    audio = np.asarray(pcm, dtype=np.float32).reshape(-1)
+    sf.write(buf, audio, int(sample_rate), format="WAV", subtype="PCM_16")
+    return f"data:audio/wav;base64,{base64.b64encode(buf.getvalue()).decode('ascii')}"
+
+
+def count_words(text: str) -> int:
+    return len((text or "").split())

@@ -20,7 +20,6 @@ def mux_video_audio_bytes(
     video_codec: str = "h264",
     audio_codec: str = "aac",
     crf: str = "18",
-    video_codec_options: dict[str, str] | None = None,
 ) -> bytes:
     """Mux video frames and optional audio waveform into MP4 bytes.
 
@@ -43,11 +42,7 @@ def mux_video_audio_bytes(
     v_stream.width = video_frames.shape[2]
     v_stream.height = video_frames.shape[1]
     v_stream.pix_fmt = "yuv420p"
-
-    options = {"crf": str(crf)}
-    if video_codec_options:
-        options.update(video_codec_options)
-    v_stream.options = options
+    v_stream.options = {"crf": crf}
 
     a_stream = None
     if audio_waveform is not None:

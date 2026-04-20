@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from functools import cached_property
@@ -32,6 +33,7 @@ from vllm.model_executor.models.qwen3 import Qwen3Model
 from vllm.model_executor.models.utils import AutoWeightsLoader, PPMissingLayer
 from vllm.model_executor.models.whisper import ISO639_1_SUPPORTED_LANGS
 from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.multimodal.hasher import MultiModalHasher
 from vllm.multimodal.inputs import (
     AudioItem,
     MultiModalFieldConfig,
@@ -52,6 +54,9 @@ from vllm.multimodal.processing import (
     PromptUpdate,
     PromptUpdateDetails,
 )
+from vllm.multimodal.processing.context import TimingContext
+from vllm.multimodal.processing.inputs import ProcessorInputs
+from vllm.multimodal.processing.processor import MultiModalProcessingInfo
 from vllm.sequence import IntermediateTensors
 from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
@@ -90,6 +95,7 @@ from vllm_omni.model_executor.models.raon.raon_utils import (
     strip_raon_audio_markers,
     unwrap_singleton_list,
 )
+from vllm_omni.model_executor.models.raon.serving_utils import RaonServingHooks
 from vllm_omni.tokenizers.raon_tokenizer import (
     AUDIO_END,
     AUDIO_END_TOKEN,
@@ -104,9 +110,11 @@ from vllm_omni.tokenizers.raon_tokenizer import (
     AUDIO_START_TOKEN,
     LEGACY_AUDIO_PLACEHOLDER_SEQ,
     USER_PROMPT_MARKER,
+    RaonResolvedIds,
     align_tokenizer,
     inject_placeholders_into_str,
     inject_placeholders_into_token_ids,
+    resolve_raon_special_ids,
     resolve_speaker_token_id,
 )
 from vllm_omni.transformers_utils.configs.raon import (
@@ -119,6 +127,8 @@ from vllm_omni.transformers_utils.configs.raon import (
 )
 
 logger = init_logger(__name__)
+
+RaonServingHooks.apply_default_modalities()
 
 
 # Token ID used by older checkpoints that encoded audio pads as <|audio_pad|>
@@ -362,9 +372,11 @@ class RaonDummyInputsBuilder(BaseDummyInputsBuilder[RaonProcessingInfo]):
 
 
 class RaonMultiModalProcessor(BaseMultiModalProcessor[RaonProcessingInfo]):
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        super().__init__(*args, **kwargs)
-        self.cache = None
+    @cached_property
+    def _ids(self) -> RaonResolvedIds:
+        """Resolve Raon special-token IDs from the live tokenizer once."""
+        tokenizer = self.info.get_tokenizer()
+        return resolve_raon_special_ids(tokenizer)
 
     def _apply_hf_processor_mm_only(
         self,
@@ -449,6 +461,124 @@ class RaonMultiModalProcessor(BaseMultiModalProcessor[RaonProcessingInfo]):
             )
         return prompt_ids, mm_processed_data, False
 
+    def _build_cache_signature_prompt_text(
+        self,
+        prompt: str | list[int],
+        num_audios: int,
+    ) -> str:
+        """Mirror prompt injection so cache signatures see post-processed placeholders."""
+        if isinstance(prompt, str):
+            tokenizer = self.info.get_tokenizer()
+            align_tokenizer(tokenizer)
+            return inject_placeholders_into_str(prompt, num_audios=num_audios)
+
+        # Token-list path — mirror the exact sequence from
+        # ``_apply_hf_processor_main`` so variants resolve identically.
+        prompt_ids = self._apply_hf_processor_tokens_only(prompt)
+        if num_audios > 0:
+            tokenizer = self.info.get_tokenizer()
+            align_tokenizer(tokenizer)
+            ph_ids = tokenizer.encode(AUDIO_PLACEHOLDER_SEQ, add_special_tokens=False)
+            legacy_ph_ids = tokenizer.encode(
+                f"{AUDIO_START_TOKEN}<|audio_pad|>{AUDIO_END_TOKEN}",
+                add_special_tokens=False,
+            )
+            marker_ids = tokenizer.encode(f"{USER_PROMPT_MARKER}", add_special_tokens=False)
+            prompt_ids = inject_placeholders_into_token_ids(
+                prompt_ids,
+                num_audios=num_audios,
+                ph_ids=ph_ids,
+                legacy_ph_ids=legacy_ph_ids,
+                marker_ids=marker_ids,
+            )
+        else:
+            tokenizer = self.info.get_tokenizer()
+            align_tokenizer(tokenizer)
+        return tokenizer.decode(prompt_ids)
+
+    @staticmethod
+    def _extract_audio_placeholder_variants(
+        prompt_text: str,
+        num_audios: int,
+    ) -> tuple[str, ...]:
+        """Classify post-injection placeholders for cache signatures."""
+        variants: list[str] = []
+        for match in AUDIO_PLACEHOLDER_PATTERN.finditer(prompt_text):
+            text = match.group(0)
+            if text == AUDIO_PLACEHOLDER_SEQ:
+                variants.append("input")
+            elif text == LEGACY_AUDIO_PLACEHOLDER_SEQ:
+                variants.append("legacy_input")
+            elif text == AUDIO_OUTPUT_PLACEHOLDER_SEQ:
+                variants.append("output_closed")
+            elif text == AUDIO_OUTPUT_OPEN_SEQ:
+                variants.append("output_open")
+            else:
+                variants.append("unknown")
+
+        if len(variants) != num_audios:
+            return (
+                f"mismatch:expected={num_audios}:found={len(variants)}",
+                *variants,
+            )
+        return tuple(variants)
+
+    def _cached_apply_hf_processor(
+        self,
+        inputs: ProcessorInputs,
+        timing_ctx: TimingContext,
+    ) -> tuple[list[int], MultiModalProcessingInfo, bool]:
+        """Salt multimodal cache keys with per-audio placeholder variants."""
+        num_audios = inputs.mm_data_items.get_count("audio", strict=False)
+        if num_audios == 0:
+            return super()._cached_apply_hf_processor(inputs, timing_ctx)
+
+        prompt_text = self._build_cache_signature_prompt_text(inputs.prompt, num_audios)
+        variants = self._extract_audio_placeholder_variants(prompt_text, num_audios)
+
+        # Per-item UUIDs keep both audio identity and prompt role in the cache key.
+        # A request-level variant tuple would invalidate sibling items unnecessarily.
+        mismatch_prefix = bool(variants) and variants[0].startswith("mismatch:")
+        mismatch_marker = variants[0] if mismatch_prefix else ""
+
+        audio_data_items = inputs.mm_data_items.get("audio")
+        items_for_hash = list(audio_data_items.get_all_items_for_hash()) if audio_data_items is not None else []
+
+        existing_uuids = (inputs.mm_uuid_items or {}).get("audio") or [None] * num_audios
+        salted_audio_uuids: list[str] = []
+        for i in range(num_audios):
+            if i < len(items_for_hash):
+                content_hash = MultiModalHasher.hash_kwargs(audio=items_for_hash[i])
+            else:
+                content_hash = f"no-item-{i}"
+            if mismatch_prefix:
+                # variants = (mismatch_marker, v0, v1, ...) — shift index by 1
+                per_item_variant = variants[i + 1] if i + 1 < len(variants) else "unknown"
+                variant_field = f"{mismatch_marker}|{per_item_variant}"
+            else:
+                per_item_variant = variants[i] if i < len(variants) else "unknown"
+                variant_field = per_item_variant
+            caller_base = existing_uuids[i] or ""
+            prefix = f"{caller_base}|" if caller_base else ""
+            salted_audio_uuids.append(f"{prefix}raon-mm-v2|content={content_hash}|idx={i}|variant={variant_field}")
+
+        new_uuids: dict[str, list[str | None] | None] = {
+            modality: list(uuids) if uuids is not None else None
+            for modality, uuids in (inputs.mm_uuid_items or {}).items()
+        }
+        new_uuids["audio"] = salted_audio_uuids
+
+        # Version marker for future cache-signature schema changes.
+        new_kwargs = dict(inputs.hf_processor_mm_kwargs)
+        new_kwargs["_raon_mm_sig_version"] = "v2"
+
+        inputs = dataclasses.replace(
+            inputs,
+            hf_processor_mm_kwargs=new_kwargs,
+            mm_uuid_items=new_uuids,
+        )
+        return super()._cached_apply_hf_processor(inputs, timing_ctx)
+
     def _get_mm_fields_config(
         self,
         hf_inputs: BatchFeature,
@@ -471,10 +601,11 @@ class RaonMultiModalProcessor(BaseMultiModalProcessor[RaonProcessingInfo]):
         sampling_rate = int(atc.sampling_rate)
         frame_rate = get_mimi_frame_rate(atc)
 
-        audio_start_token_id = AUDIO_START.id
-        audio_end_token_id = AUDIO_END.id
-        audio_input_token_id = AUDIO_INPUT_PLACEHOLDER.id
-        audio_output_token_id = AUDIO_OUTPUT_PLACEHOLDER.id
+        ids = self._ids
+        audio_start_token_id = ids.audio_start
+        audio_end_token_id = ids.audio_end
+        audio_input_token_id = ids.audio_input_placeholder
+        audio_output_token_id = ids.audio_output_placeholder
 
         audios = mm_items.get_items("audio", AudioProcessorItems)
 
@@ -764,6 +895,10 @@ class RaonModel(
         self._register_thinker_hook()
         self._init_speaker()
         self._resolve_tokenizer_ids()
+
+        from vllm_omni.model_executor.models.raon.logits_routing import LogitsRouter
+
+        self._logits_router = LogitsRouter(self)
 
     @cached_property
     def sampler(self) -> Sampler:
@@ -1582,129 +1717,6 @@ class RaonModel(
         ).to(torch.long)
         return full_codes
 
-    def _sample_audio_token(
-        self,
-        *,
-        logits: torch.Tensor,
-        row_idx: int,
-        req_info: dict[str, Any] | None,
-        req_runtime_id: str | None,
-        req_state: AudioDecodeState | None,
-        audio_hidden_states: torch.Tensor | None,
-    ) -> None:
-        """Sample audio codec token and generate remaining RVQ codes."""
-        audio_logits_row = (
-            self.audio_lm_head(audio_hidden_states[row_idx : row_idx + 1]).squeeze(0)
-            if audio_hidden_states is not None
-            else None
-        )
-        if audio_logits_row is None:
-            self._force_token_in_logits(logits, row_idx, int(self.audio_output_token_id))
-            return
-
-        in_silence_window = (
-            req_state is not None
-            and req_state.continuation_silence_frames > 0
-            and req_state.audio_step_index < req_state.continuation_silence_frames
-        )
-
-        # Suppress AUDIO_END during silence window + 1 grace step.
-        _eos_suppress_until = (
-            req_state.continuation_silence_frames + 2
-            if req_state is not None and req_state.continuation_silence_frames > 0
-            else 0
-        )
-        if req_state is not None and req_state.audio_step_index < _eos_suppress_until:
-            audio_logits_row = audio_logits_row.clone()
-            audio_logits_row[self.codebook_size] = float("-inf")
-
-        if ENV.tts_temperature != 1.0 or ENV.tts_top_k > 0 or ENV.tts_top_p < 1.0:
-            audio_logits_row = self._apply_audio_sampling_params(audio_logits_row)
-        first_code = int(torch.multinomial(torch.softmax(audio_logits_row.float(), dim=-1), 1).item())
-
-        if in_silence_window:
-            silence = self._get_silence_codes()
-            step_idx = req_state.audio_step_index
-            silence_frame = silence[step_idx] if step_idx < silence.shape[0] else silence[-1]
-            row_state = req_state
-            row_state.pending_audio_codes = silence_frame.unsqueeze(0).to(device=logits.device)
-            row_state.is_generating_audio = True
-            # audio_step_index is incremented in audio_preprocess; do NOT double-increment here.
-            self._force_token_in_logits(logits, row_idx, int(self.audio_output_token_id))
-            return
-
-        # Build layer-0 code history from per-request state.
-        recent_codes = req_state.code_history
-        first_code = self._ras.maybe_resample(recent_codes, first_code, audio_logits_row, self.codebook_size)
-
-        if first_code == self.codebook_size:
-            logits[row_idx, :] = float("-inf")
-            if isinstance(self.audio_end_token_id, int) and 0 <= self.audio_end_token_id < int(logits.shape[-1]):
-                logits[row_idx, self.audio_end_token_id] = 0.0
-            return
-
-        req_state.code_history.append(first_code)
-        row_state = req_state
-        audio_hidden_row = audio_hidden_states[row_idx : row_idx + 1] if audio_hidden_states is not None else None
-
-        speaker_batch: torch.Tensor | None = None
-        if isinstance(req_info, dict) and self.proj_speaker_code is not None:
-            speaker_embed = unwrap_singleton_list(req_info.get("speaker_embeds"))
-            if isinstance(speaker_embed, torch.Tensor):
-                if speaker_embed.ndim == 3:
-                    speaker_embed = speaker_embed[:, 0, :]
-                if speaker_embed.ndim == 2:
-                    speaker_embed = speaker_embed[0]
-                if speaker_embed.ndim == 1:
-                    speaker_batch = speaker_embed.to(device=logits.device, dtype=self.proj_code.weight.dtype).view(
-                        1, 1, -1
-                    )
-
-        if audio_hidden_row is not None:
-            full_codes = self._predict_rvq_codes(
-                first_code=first_code,
-                audio_hidden_row=audio_hidden_row,
-                device=logits.device,
-                speaker_embeds=speaker_batch,
-            )
-            row_state.pending_audio_codes = full_codes
-
-        self._force_token_in_logits(logits, row_idx, int(self.audio_output_token_id))
-
-    def _generate_audio_for_row(
-        self,
-        *,
-        logits: torch.Tensor,
-        row_idx: int,
-        req_info: dict[str, Any] | None,
-        req_runtime_id: str | None,
-        req_state: AudioDecodeState | None,
-        force_audio_first_token: bool,
-        is_sampled_row: bool,
-        row_output_ids: list[int],
-        audio_hidden_states: torch.Tensor | None,
-    ) -> None:
-        forced_audio_bootstrap = False
-        if force_audio_first_token and is_sampled_row:
-            forced_audio_bootstrap = (
-                not bool(req_state.forced_audio_bootstrap_done) if req_state is not None else not row_output_ids
-            )
-
-        if forced_audio_bootstrap:
-            self._forced_bootstrap_audio(logits, row_idx, req_state)
-            return
-        if not is_sampled_row:
-            return
-
-        self._sample_audio_token(
-            logits=logits,
-            row_idx=row_idx,
-            req_info=req_info,
-            req_runtime_id=req_runtime_id,
-            req_state=req_state,
-            audio_hidden_states=audio_hidden_states,
-        )
-
     def _is_all_audio_only(self, queued_runtime_info: list[Any]) -> bool:
         if not queued_runtime_info:
             return False
@@ -1744,8 +1756,6 @@ class RaonModel(
         )
         if use_split and self._is_all_audio_only(queued_runtime_info):
             return self._build_audio_only_logits(hidden_states)
-        if use_split:
-            return self.logits_processor(self.lm_head, hidden_states)
         return self.logits_processor(self.lm_head, hidden_states)
 
     def _resolve_row_runtime_info(self, runtime_info: list[Any], row_count: int) -> list[Any]:
@@ -1787,63 +1797,6 @@ class RaonModel(
             elif row_idx < len(output_token_ids):
                 row_output_ids = output_token_ids[row_idx]
         return row_output_ids, is_sampled_row
-
-    def _apply_row_mode_adjustments(
-        self,
-        *,
-        logits: torch.Tensor,
-        row_runtime_info: list[Any],
-        output_token_ids: Any,
-        audio_hidden_states: torch.Tensor | None,
-    ) -> None:
-        row_count = len(row_runtime_info)
-        for row_idx, req_info_raw in enumerate(row_runtime_info):
-            req_info = req_info_raw if isinstance(req_info_raw, dict) else None
-            mode = self._normalize_output_mode(req_info)
-
-            force_audio_first_token = False
-            req_runtime_id: str | None = None
-            req_state: AudioDecodeState | None = None
-            if req_info is not None:
-                force_audio_first_token = bool(unwrap_singleton_list(req_info.get("force_audio_first_token", False)))
-                csf_raw = unwrap_singleton_list(
-                    req_info.get("continuation_silence_frames", 0),
-                )
-                csf = int(csf_raw) if csf_raw else 0
-                req_runtime_id = normalize_runtime_request_id(
-                    req_info.get("global_request_id", req_info.get("_omni_req_id"))
-                )
-                req_state = self._get_audio_decode_state(req_info)
-                if req_state.continuation_silence_frames == 0 and csf > 0:
-                    req_state.continuation_silence_frames = csf
-            if (
-                req_runtime_id is not None
-                and audio_hidden_states is not None
-                and row_idx < audio_hidden_states.shape[0]
-            ):
-                self._step_talker_hidden_rows[req_runtime_id] = audio_hidden_states[row_idx : row_idx + 1].clone()
-
-            row_output_ids, is_sampled_row = self._resolve_row_sampling_state(
-                output_token_ids=output_token_ids,
-                row_idx=row_idx,
-                row_count=row_count,
-            )
-            if mode == "audio_only":
-                self._generate_audio_for_row(
-                    logits=logits,
-                    row_idx=row_idx,
-                    req_info=req_info,
-                    req_runtime_id=req_runtime_id,
-                    req_state=req_state,
-                    force_audio_first_token=force_audio_first_token,
-                    is_sampled_row=is_sampled_row,
-                    row_output_ids=row_output_ids,
-                    audio_hidden_states=audio_hidden_states,
-                )
-                if req_runtime_id is not None and req_state is not None:
-                    self._step_decode_states[req_runtime_id] = req_state
-            else:
-                self._mask_audio_logits_for_text_mode(logits, row_idx)
 
     def _suppress_first_step_eos(self, logits: torch.Tensor, output_token_ids: Any) -> None:
         eos = self.eos_token_id
@@ -1891,7 +1844,7 @@ class RaonModel(
             getattr(sampling_metadata, "output_token_ids", None) if sampling_metadata is not None else None
         )
         if (row_ri := self._resolve_row_runtime_info(runtime_info, int(logits.shape[0]))) is not None:
-            self._apply_row_mode_adjustments(
+            self._logits_router.apply_row_mode_adjustments(
                 logits=logits,
                 row_runtime_info=row_ri,
                 output_token_ids=output_token_ids,

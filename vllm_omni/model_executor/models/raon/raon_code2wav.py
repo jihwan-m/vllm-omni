@@ -454,7 +454,7 @@ class RaonCode2WavModel(
 
         if stream_req_id is not None:
             has_codec = input_ids is not None and input_ids.numel() > 0
-            has_codec_info = isinstance(req_info, dict) and req_info.get("codec_codes")
+            has_codec_info = isinstance(req_info, dict) and req_info.get("codec_codes") is not None
             if not has_codec and not has_codec_info:
                 return self._empty_stage1_output()
 

@@ -4,10 +4,10 @@
 
 import types
 from dataclasses import dataclass
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
-from pytest_mock import MockerFixture
 
 from vllm_omni.diffusion.models.bagel.bagel_transformer import (
     Bagel,
@@ -23,9 +23,9 @@ NUM_TIMESTEPS = 5
 EXPECTED_STEPS = NUM_TIMESTEPS - 1
 
 
-def _make_mock_bagel(mocker: MockerFixture):
+def _make_mock_bagel():
     """Create a mock Bagel with forward returning constant velocity."""
-    mock = mocker.MagicMock(spec=Bagel)
+    mock = MagicMock(spec=Bagel)
     mock._sp_size = 1
 
     # forward returns a small constant velocity so x_t changes each step
@@ -78,22 +78,18 @@ def _make_generate_args(num_tokens=NUM_TOKENS, hidden_dim=HIDDEN_DIM, cfg=False)
 
 
 @pytest.fixture(params=[False, True], ids=["no_cfg", "batched_cfg"])
-def bagel_and_args(
-    request,
-    monkeypatch: pytest.MonkeyPatch,
-    mocker: MockerFixture,
-):
+def bagel_and_args(request):
     """Mock Bagel instance and generate_image arguments.
 
     Parametrized over CFG mode so every test runs on both the no-CFG
     and batched-CFG code paths.
     """
     cfg = request.param
-    monkeypatch.setattr(
+    with patch(
         "vllm_omni.diffusion.models.bagel.bagel_transformer.get_classifier_free_guidance_world_size",
-        lambda: 1,
-    )
-    yield _make_mock_bagel(mocker), _make_generate_args(cfg=cfg)
+        return_value=1,
+    ):
+        yield _make_mock_bagel(), _make_generate_args(cfg=cfg)
 
 
 class TestTrajectoryRecording:
@@ -192,16 +188,12 @@ class TestTrajectoryLogProbs:
     """Tests for log-prob recording when a scheduler is provided."""
 
     @pytest.fixture()
-    def bagel_scheduler_args(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-        mocker: MockerFixture,
-    ):
-        monkeypatch.setattr(
+    def bagel_scheduler_args(self):
+        with patch(
             "vllm_omni.diffusion.models.bagel.bagel_transformer.get_classifier_free_guidance_world_size",
-            lambda: 1,
-        )
-        yield _make_mock_bagel(mocker), _make_generate_args(), _MockScheduler()
+            return_value=1,
+        ):
+            yield _make_mock_bagel(), _make_generate_args(), _MockScheduler()
 
     def test_log_probs_recorded_with_scheduler(self, bagel_scheduler_args):
         bagel, args, scheduler = bagel_scheduler_args

@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Unit tests for Raon model configuration, audio encoding, and multimodal processing."""
+"""Unit tests for Raon model and config helpers."""
 
 from __future__ import annotations
 
+import logging
 from types import SimpleNamespace
 
 import pytest
@@ -40,9 +41,29 @@ from vllm_omni.transformers_utils.configs.raon import (
     RaonConfig,
     SpeakerEncoderConfig,
     _build_subconfig,
+    _load_raon_env_config,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+def _capture_records(target_logger: logging.Logger, level: int) -> tuple[list[logging.LogRecord], logging.Handler, int]:
+    records: list[logging.LogRecord] = []
+
+    class _ListHandler(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    handler = _ListHandler(level=level)
+    prev_level = target_logger.level
+    target_logger.addHandler(handler)
+    target_logger.setLevel(level)
+    return records, handler, prev_level
+
+
+def _restore_records(target_logger: logging.Logger, handler: logging.Handler, prev_level: int) -> None:
+    target_logger.removeHandler(handler)
+    target_logger.setLevel(prev_level)
 
 
 # ===================================================================
@@ -238,6 +259,18 @@ class TestResolveAudioOutputTokenId:
         assert cfg.audio_output_token_id == 151675
         assert isinstance(cfg.audio_output_token_id, int)
 
+    def test_default_logs_warning(self):
+        from vllm_omni.transformers_utils.configs import raon as raon_config_module
+
+        records, handler, prev_level = _capture_records(raon_config_module.logger, logging.WARNING)
+        try:
+            cfg = self._make_config(audio_input_token_id=151676)
+        finally:
+            _restore_records(raon_config_module.logger, handler, prev_level)
+
+        assert cfg.audio_output_token_id == 151675
+        assert any("audio_output_token_id omitted" in record.getMessage() for record in records)
+
 
 # ===================================================================
 # Configuration: RaonConfig._resolve_audio_input_token_id
@@ -264,6 +297,18 @@ class TestResolveAudioInputTokenId:
         assert cfg.audio_input_token_id == 151676
         assert isinstance(cfg.audio_input_token_id, int)
 
+    def test_default_logs_warning(self):
+        from vllm_omni.transformers_utils.configs import raon as raon_config_module
+
+        records, handler, prev_level = _capture_records(raon_config_module.logger, logging.WARNING)
+        try:
+            cfg = RaonConfig(audio_output_token_id=151675)
+        finally:
+            _restore_records(raon_config_module.logger, handler, prev_level)
+
+        assert cfg.audio_input_token_id == 151676
+        assert any("audio_input_token_id omitted" in record.getMessage() for record in records)
+
 
 # ===================================================================
 # Configuration: RaonConfig construction
@@ -278,6 +323,32 @@ class TestRaonConfigConstruction:
         assert cfg.audio_input_token_id is None
         assert cfg.speaker_token_id is None
         assert cfg.speaker_embedding_to_code_predictor is None
+
+    def test_env_defaults_to_rolling_icl_and_logs(self, monkeypatch):
+        from vllm_omni.transformers_utils.configs import raon as raon_config_module
+
+        for name in (
+            "RAON_TTS_LONG_MODE",
+            "RAON_TTS_LONG_MAX_SENTENCES_PER_CHUNK",
+            "RAON_TTS_LONG_ENABLE_FINAL_BEST_OF_K",
+        ):
+            monkeypatch.delenv(name, raising=False)
+
+        records, handler, prev_level = _capture_records(raon_config_module.logger, logging.INFO)
+        try:
+            env = _load_raon_env_config()
+        finally:
+            _restore_records(raon_config_module.logger, handler, prev_level)
+
+        assert env.tts_long_mode == "rolling_icl"
+        assert env.tts_long_max_sentences_per_chunk == 1
+        assert env.tts_long_enable_final_best_of_k is True
+        assert any(
+            "tts_long_mode=rolling_icl" in record.getMessage()
+            and "tts_long_max_sentences_per_chunk=1" in record.getMessage()
+            and "tts_long_enable_final_best_of_k=True" in record.getMessage()
+            for record in records
+        )
 
     @pytest.mark.parametrize(
         "kwarg,field,config_type,check_field,check_val",
@@ -881,12 +952,38 @@ def test_audio_preprocess_projects_cached_speaker_embedding_to_hidden_size():
     assert torch.equal(new_embeds[1], expected)
 
 
-def test_apply_row_mode_adjustments_tracks_per_request_talker_hidden_for_text_only():
+def test_forward_stage1_single_accepts_codec_codes_tensor_when_input_ids_empty():
+    from vllm_omni.model_executor.models.raon.raon_code2wav import RaonCode2WavModel
+
+    model = object.__new__(RaonCode2WavModel)
+    model.sampling_rate = 24000
+    model._resolve_stage1_streaming_info = lambda req_info: ("rid", False, False)
+    model._resolve_stage1_codec_codes = lambda input_ids, req_info: torch.zeros((1, 2, 8), dtype=torch.long)
+    model._decode_stage1_audio = lambda codec_codes: torch.ones((1, 320), dtype=torch.float32)
+    model._trim_right_padding_audio = lambda audio, total_frames: audio
+    model._trim_left_context_audio = lambda audio, left_context_size, total_frames: audio
+    model._clear_streaming_state = lambda req_id: None
+
+    req_info = {
+        "global_request_id": "rid",
+        "codec_codes": torch.zeros((2, 8), dtype=torch.long),
+    }
+
+    result = model._forward_stage1_single(torch.empty(0, dtype=torch.long), req_info)
+
+    assert result.multimodal_outputs is not None
+    assert result.multimodal_outputs["model_outputs"].shape[-1] == 320
+
+
+def test_logits_router_apply_row_mode_adjustments_tracks_per_request_talker_hidden_for_text_only():
+    from vllm_omni.model_executor.models.raon.logits_routing import LogitsRouter
+
     model = object.__new__(RaonModel)
     model.audio_output_token_id = 7
     model._step_talker_hidden_rows = {}
     model._step_decode_states = {}
     model._mask_audio_logits_for_text_mode = lambda logits, row_idx: None
+    model._logits_router = LogitsRouter(model)
 
     logits = torch.zeros((2, 8), dtype=torch.float32)
     audio_hidden_states = torch.tensor(
@@ -894,7 +991,7 @@ def test_apply_row_mode_adjustments_tracks_per_request_talker_hidden_for_text_on
         dtype=torch.float32,
     )
 
-    model._apply_row_mode_adjustments(
+    model._logits_router.apply_row_mode_adjustments(
         logits=logits,
         row_runtime_info=[
             {"_omni_req_id": "req-a", "output_mode": ["text_only"]},

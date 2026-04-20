@@ -1,7 +1,8 @@
 """Unit tests for OmniBase and AsyncOmni profiler methods."""
 
+from unittest.mock import MagicMock, patch
+
 import pytest
-from pytest_mock import MockerFixture
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -10,12 +11,12 @@ class TestOmniBaseProfiler:
     """Test suite for OmniBase profiler methods (start_profile, stop_profile)."""
 
     @pytest.fixture
-    def mock_engine(self, mocker: MockerFixture):
+    def mock_engine(self):
         """Create a mock AsyncOmniEngine for testing."""
-        engine = mocker.MagicMock()
+        engine = MagicMock()
         engine.num_stages = 3
         engine.is_alive.return_value = True
-        engine.default_sampling_params_list = [mocker.MagicMock() for _ in range(3)]
+        engine.default_sampling_params_list = [MagicMock() for _ in range(3)]
         engine.get_stage_metadata.side_effect = lambda i: {
             "final_output_type": "text" if i == 0 else "audio",
             "final_output": True,
@@ -24,15 +25,17 @@ class TestOmniBaseProfiler:
         return engine
 
     @pytest.fixture
-    def omni_base_instance(self, mock_engine, mocker: MockerFixture):
+    def omni_base_instance(self, mock_engine):
         """Create an OmniBase instance with mocked dependencies."""
-        mocker.patch("vllm_omni.entrypoints.omni_base.AsyncOmniEngine", return_value=mock_engine)
-        mocker.patch("vllm_omni.entrypoints.omni_base.omni_snapshot_download", side_effect=lambda x: x)
-        mocker.patch("vllm_omni.entrypoints.omni_base.weakref.finalize")
-        from vllm_omni.entrypoints.omni_base import OmniBase
+        with (
+            patch("vllm_omni.entrypoints.omni_base.AsyncOmniEngine", return_value=mock_engine),
+            patch("vllm_omni.entrypoints.omni_base.omni_snapshot_download", side_effect=lambda x: x),
+            patch("vllm_omni.entrypoints.omni_base.weakref.finalize"),
+        ):
+            from vllm_omni.entrypoints.omni_base import OmniBase
 
-        instance = OmniBase(model="test-model")
-        return instance
+            instance = OmniBase(model="test-model")
+            return instance
 
     def test_start_profile_calls_collective_rpc(self, omni_base_instance, mock_engine):
         """Test that start_profile calls collective_rpc with correct arguments."""

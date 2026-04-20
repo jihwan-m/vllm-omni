@@ -6,7 +6,7 @@ explicitly patch values that differ from vLLM.
 
 import argparse
 import inspect
-from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 from pydantic import ValidationError
@@ -102,7 +102,7 @@ def test_qwen3_tts_codec_frame_rate_patching():
     vllm_config = EngineArgs().create_model_config()
 
     # Create a mock talking config with a dummy value for position_id_per_seconds
-    mock_talker_config = SimpleNamespace()
+    mock_talker_config = Mock()
     mock_talker_config.position_id_per_seconds = 12.3
     vllm_config.hf_config.talker_config = mock_talker_config
 
@@ -116,6 +116,13 @@ def test_qwen3_tts_codec_frame_rate_patching():
 
     # Verify codec_frame_rate_hz was patched
     assert omni_config.codec_frame_rate_hz == 12.3
+
+
+def test_stage_configs_path_blocks_create_model_config():
+    """create_model_config() should raise when stage_configs_path is set."""
+    args = OmniEngineArgs(stage_configs_path="/some/path.yaml")
+    with pytest.raises(RuntimeError, match="stage_configs_path"):
+        args.create_model_config()
 
 
 def test_from_cli_args_picks_up_stage_configs_path():
@@ -139,12 +146,13 @@ def test_stage_specific_text_config_override():
     # Switch the created hf text config with a mock whose
     # values we want to pull through the text config helper
     stage_text_config = vllm_config.hf_text_config
-    vllm_config.hf_text_config = SimpleNamespace()
+    vllm_config.hf_text_config = Mock()
     stage_text_config.sliding_window = 4096
     stage_text_config.attention_chunk_size = 2048
 
     # Move the stage config's text config getter & thinker config
-    mock_stage_config = SimpleNamespace(get_text_config=lambda: stage_text_config)
+    mock_stage_config = Mock()
+    mock_stage_config.get_text_config.return_value = stage_text_config
     vllm_config.hf_config.thinker_config = mock_stage_config
 
     # Ensure that create from a vLLM config correctly pulls the

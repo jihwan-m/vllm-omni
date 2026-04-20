@@ -3,6 +3,8 @@
 
 """Unit tests for SequentialOffloadBackend."""
 
+from unittest.mock import patch
+
 import pytest
 import torch
 from torch import nn
@@ -42,7 +44,7 @@ def _track_pin_memory_calls():
 
 
 class TestMoveParamsPinMemory:
-    def test_dtensor_skips_pin_memory(self, accelerator_device, monkeypatch: pytest.MonkeyPatch):
+    def test_dtensor_skips_pin_memory(self, accelerator_device):
         """DTensor should skip pin_memory to avoid RuntimeError."""
         module = _create_simple_module().to(accelerator_device)
         tracker, mock_pin = _track_pin_memory_calls()
@@ -54,73 +56,73 @@ class TestMoveParamsPinMemory:
                 return True
             return original_isinstance(obj, cls)
 
-        monkeypatch.setattr(torch.Tensor, "pin_memory", mock_pin)
-        monkeypatch.setattr("builtins.isinstance", fake_isinstance)
-        hook = SequentialOffloadHook(
-            offload_targets=[],
-            device=accelerator_device,
-            pin_memory=True,
-            use_hsdp=False,
-        )
-        hook._move_params(
-            module,
-            torch.device("cpu"),
-            non_blocking=False,
-            pin_memory=True,
-        )
-        assert not tracker["called"], "pin_memory should not be called for DTensor"
+        with patch.object(torch.Tensor, "pin_memory", mock_pin):
+            with patch("builtins.isinstance", fake_isinstance):
+                hook = SequentialOffloadHook(
+                    offload_targets=[],
+                    device=accelerator_device,
+                    pin_memory=True,
+                    use_hsdp=False,
+                )
+                hook._move_params(
+                    module,
+                    torch.device("cpu"),
+                    non_blocking=False,
+                    pin_memory=True,
+                )
+                assert not tracker["called"], "pin_memory should not be called for DTensor"
 
-    def test_regular_tensor_calls_pin_memory(self, accelerator_device, monkeypatch: pytest.MonkeyPatch):
+    def test_regular_tensor_calls_pin_memory(self, accelerator_device):
         """Regular tensor should call pin_memory when moving to CPU."""
         module = _create_simple_module().to(accelerator_device)
         tracker, mock_pin = _track_pin_memory_calls()
 
-        monkeypatch.setattr(torch.Tensor, "pin_memory", mock_pin)
-        hook = SequentialOffloadHook(
-            offload_targets=[],
-            device=accelerator_device,
-            pin_memory=True,
-            use_hsdp=False,
-        )
-        hook._move_params(
-            module,
-            torch.device("cpu"),
-            non_blocking=False,
-            pin_memory=True,
-        )
-        assert tracker["called"], "pin_memory should be called for regular tensors"
+        with patch.object(torch.Tensor, "pin_memory", mock_pin):
+            hook = SequentialOffloadHook(
+                offload_targets=[],
+                device=accelerator_device,
+                pin_memory=True,
+                use_hsdp=False,
+            )
+            hook._move_params(
+                module,
+                torch.device("cpu"),
+                non_blocking=False,
+                pin_memory=True,
+            )
+            assert tracker["called"], "pin_memory should be called for regular tensors"
 
-    def test_pin_memory_skipped_when_disabled(self, accelerator_device, monkeypatch: pytest.MonkeyPatch):
+    def test_pin_memory_skipped_when_disabled(self, accelerator_device):
         """pin_memory should not be called when pin_memory=False."""
         module = _create_simple_module().to(accelerator_device)
         tracker, mock_pin = _track_pin_memory_calls()
 
-        monkeypatch.setattr(torch.Tensor, "pin_memory", mock_pin)
-        hook = SequentialOffloadHook(
-            offload_targets=[],
-            device=accelerator_device,
-            pin_memory=False,
-            use_hsdp=False,
-        )
-        hook._move_params(
-            module,
-            torch.device("cpu"),
-            non_blocking=False,
-            pin_memory=False,
-        )
-        assert not tracker["called"], "pin_memory should not be called when disabled"
+        with patch.object(torch.Tensor, "pin_memory", mock_pin):
+            hook = SequentialOffloadHook(
+                offload_targets=[],
+                device=accelerator_device,
+                pin_memory=False,
+                use_hsdp=False,
+            )
+            hook._move_params(
+                module,
+                torch.device("cpu"),
+                non_blocking=False,
+                pin_memory=False,
+            )
+            assert not tracker["called"], "pin_memory should not be called when disabled"
 
-    def test_pin_memory_skipped_for_non_cpu_target(self, accelerator_device, monkeypatch: pytest.MonkeyPatch):
+    def test_pin_memory_skipped_for_non_cpu_target(self, accelerator_device):
         """pin_memory should not be called for non-CPU targets."""
         module = _create_simple_module().to("cpu")
         tracker, mock_pin = _track_pin_memory_calls()
 
-        monkeypatch.setattr(torch.Tensor, "pin_memory", mock_pin)
-        hook = SequentialOffloadHook(
-            offload_targets=[],
-            device=torch.device("cpu"),
-            pin_memory=True,
-            use_hsdp=False,
-        )
-        hook._move_params(module, accelerator_device, non_blocking=False, pin_memory=True)
-        assert not tracker["called"], "pin_memory should not be called for non-CPU target"
+        with patch.object(torch.Tensor, "pin_memory", mock_pin):
+            hook = SequentialOffloadHook(
+                offload_targets=[],
+                device=torch.device("cpu"),
+                pin_memory=True,
+                use_hsdp=False,
+            )
+            hook._move_params(module, accelerator_device, non_blocking=False, pin_memory=True)
+            assert not tracker["called"], "pin_memory should not be called for non-CPU target"

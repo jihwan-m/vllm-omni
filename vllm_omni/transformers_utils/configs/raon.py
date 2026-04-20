@@ -16,6 +16,9 @@ from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
 )
 from vllm.logger import init_logger
 
+# DEPRECATED: hardcoded audio-token fallbacks for configs that omit these
+# fields. New callers should resolve live tokenizer IDs instead of silently
+# relying on the placeholder defaults.
 _AUDIO_OUTPUT_PLACEHOLDER_ID = 151675
 _AUDIO_INPUT_PLACEHOLDER_ID = 151676
 
@@ -63,10 +66,35 @@ class RaonEnvConfig:
     # Continuation silence
     continuation_silence_frames: int = 2
     max_audio_duration_s: int = 0  # 0 = no limit
+    tts_long_mode: str = "rolling_icl"
+    tts_long_word_threshold: int = 90
+    tts_long_max_sentences_per_chunk: int = 1
+    tts_long_anchor_reset_every_chunks: int = 5
+    tts_long_enable_stitch_trim: bool = True
+    tts_long_ref_text_mode: str = "full_prev_chunk"
+    tts_long_pause_ms_period: int = 100
+    tts_long_pause_ms_clause: int = 30
+    tts_long_min_ref_audio_s: float = 1.0
+    tts_long_keep_original_speaker_anchor: bool = True
+    tts_long_eos_suppress_grace_steps: int = 2
+    tts_long_enable_final_best_of_k: bool = True
+    tts_long_final_best_of_k: int = 5
+    tts_long_final_best_of_k_early_exit_ratio: float = 1.15
+    tts_long_final_best_of_k_expected_wps: float = 2.8
+    tts_long_final_best_of_k_score_mode: str = "duration"
+
+
+def _log_long_tts_config(config: RaonEnvConfig) -> None:
+    logger.info(
+        "Raon long-TTS config: tts_long_mode=%s tts_long_max_sentences_per_chunk=%d tts_long_enable_final_best_of_k=%s",
+        config.tts_long_mode,
+        config.tts_long_max_sentences_per_chunk,
+        config.tts_long_enable_final_best_of_k,
+    )
 
 
 def _load_raon_env_config() -> RaonEnvConfig:
-    return RaonEnvConfig(
+    config = RaonEnvConfig(
         tts_temperature=float(os.getenv("RAON_TTS_TEMPERATURE", "1.0")),
         tts_top_k=int(os.getenv("RAON_TTS_TOP_K", "0")),
         tts_top_p=float(os.getenv("RAON_TTS_TOP_P", "1.0")),
@@ -83,7 +111,34 @@ def _load_raon_env_config() -> RaonEnvConfig:
         async_chunk_interval=int(os.getenv("RAON_ASYNC_CHUNK_INTERVAL", "25")),
         continuation_silence_frames=int(os.getenv("RAON_CONTINUATION_SILENCE_FRAMES", "2")),
         max_audio_duration_s=int(os.getenv("RAON_MAX_AUDIO_DURATION_S", "0")),
+        tts_long_mode=os.getenv("RAON_TTS_LONG_MODE", "rolling_icl").strip().lower(),
+        tts_long_word_threshold=int(os.getenv("RAON_TTS_LONG_WORD_THRESHOLD", "90")),
+        tts_long_max_sentences_per_chunk=int(os.getenv("RAON_TTS_LONG_MAX_SENTENCES_PER_CHUNK", "1")),
+        tts_long_anchor_reset_every_chunks=int(os.getenv("RAON_TTS_LONG_ANCHOR_RESET_EVERY_CHUNKS", "5")),
+        tts_long_enable_stitch_trim=os.getenv("RAON_TTS_LONG_ENABLE_STITCH_TRIM", "1").strip().lower()
+        not in ("0", "false", "no", "off"),
+        tts_long_ref_text_mode=os.getenv("RAON_TTS_LONG_REF_TEXT_MODE", "full_prev_chunk").strip().lower(),
+        tts_long_pause_ms_period=int(os.getenv("RAON_TTS_LONG_PAUSE_MS_PERIOD", "100")),
+        tts_long_pause_ms_clause=int(os.getenv("RAON_TTS_LONG_PAUSE_MS_CLAUSE", "30")),
+        tts_long_min_ref_audio_s=float(os.getenv("RAON_TTS_LONG_MIN_REF_AUDIO_S", "1.0")),
+        tts_long_keep_original_speaker_anchor=os.getenv("RAON_TTS_LONG_KEEP_ORIGINAL_SPEAKER_ANCHOR", "1")
+        .strip()
+        .lower()
+        not in ("0", "false", "no", "off"),
+        tts_long_eos_suppress_grace_steps=int(os.getenv("RAON_TTS_LONG_EOS_SUPPRESS_GRACE_STEPS", "2")),
+        tts_long_enable_final_best_of_k=os.getenv("RAON_TTS_LONG_ENABLE_FINAL_BEST_OF_K", "1").strip().lower()
+        not in ("0", "false", "no", "off"),
+        tts_long_final_best_of_k=int(os.getenv("RAON_TTS_LONG_FINAL_BEST_OF_K", "5")),
+        tts_long_final_best_of_k_early_exit_ratio=float(
+            os.getenv("RAON_TTS_LONG_FINAL_BEST_OF_K_EARLY_EXIT_RATIO", "1.15")
+        ),
+        tts_long_final_best_of_k_expected_wps=float(os.getenv("RAON_TTS_LONG_FINAL_BEST_OF_K_EXPECTED_WPS", "2.8")),
+        tts_long_final_best_of_k_score_mode=os.getenv("RAON_TTS_LONG_FINAL_BEST_OF_K_SCORE_MODE", "duration")
+        .strip()
+        .lower(),
     )
+    _log_long_tts_config(config)
+    return config
 
 
 ENV = _load_raon_env_config()
@@ -338,6 +393,10 @@ class RaonConfig(PretrainedConfig):
             return int(audio_output_token_id)
         if audio_token_id is not None:
             return int(audio_token_id)
+        logger.warning(
+            "RaonConfig.audio_output_token_id omitted; falling back to hardcoded default %d.",
+            _AUDIO_OUTPUT_PLACEHOLDER_ID,
+        )
         return _AUDIO_OUTPUT_PLACEHOLDER_ID
 
     def _resolve_audio_input_token_id(
@@ -347,6 +406,10 @@ class RaonConfig(PretrainedConfig):
     ) -> int:
         if audio_input_token_id is not None:
             return int(audio_input_token_id)
+        logger.warning(
+            "RaonConfig.audio_input_token_id omitted; falling back to hardcoded default %d.",
+            _AUDIO_INPUT_PLACEHOLDER_ID,
+        )
         return _AUDIO_INPUT_PLACEHOLDER_ID
 
     def get_text_config(self, decoder: bool = False) -> PretrainedConfig:

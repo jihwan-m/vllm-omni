@@ -3,7 +3,7 @@
 
 import queue
 import threading
-from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
@@ -24,9 +24,11 @@ def _tagged_output(tag: str) -> DiffusionOutput:
     return DiffusionOutput(output=torch.tensor([0]), error=tag)
 
 
-def _mock_request(tag: str):
-    """Return a lightweight request object identifiable by *tag*."""
-    return SimpleNamespace(request_ids=[tag])
+def _mock_request(tag: str) -> Mock:
+    """Return a mock ``OmniDiffusionRequest`` identifiable by *tag*."""
+    req = Mock()
+    req.request_ids = [tag]
+    return req
 
 
 def _make_executor(num_gpus: int = 1):
@@ -34,18 +36,20 @@ def _make_executor(num_gpus: int = 1):
 
     Returns ``(executor, request_queue, result_queue)``.
     """
-    od_cfg = SimpleNamespace(num_gpus=num_gpus)
-    monkeypatch = pytest.MonkeyPatch()
-    monkeypatch.setattr(MultiprocDiffusionExecutor, "_init_executor", lambda self: None)
-    executor = MultiprocDiffusionExecutor(od_cfg)
-    monkeypatch.undo()
+    od_cfg = Mock()
+    od_cfg.num_gpus = num_gpus
+
+    with patch.object(MultiprocDiffusionExecutor, "_init_executor"):
+        executor = MultiprocDiffusionExecutor(od_cfg)
 
     req_q: queue.Queue = queue.Queue()
     res_q: queue.Queue = queue.Queue()
 
-    mock_broadcast_mq = SimpleNamespace(enqueue=req_q.put)
+    mock_broadcast_mq = Mock()
+    mock_broadcast_mq.enqueue = req_q.put
 
-    mock_rmq = SimpleNamespace(dequeue=lambda timeout=None: res_q.get(timeout=timeout if timeout is not None else 10))
+    mock_rmq = Mock()
+    mock_rmq.dequeue = lambda timeout=None: res_q.get(timeout=timeout if timeout is not None else 10)
 
     executor._broadcast_mq = mock_broadcast_mq
     executor._result_mq = mock_rmq
@@ -59,7 +63,7 @@ def _make_engine(num_gpus: int = 1):
     executor, req_q, res_q = _make_executor(num_gpus)
     engine = DiffusionEngine.__new__(DiffusionEngine)
     sched = RequestScheduler()
-    sched.initialize(SimpleNamespace())
+    sched.initialize(Mock())
     engine.scheduler = sched
     engine.executor = executor
     engine._rpc_lock = threading.RLock()

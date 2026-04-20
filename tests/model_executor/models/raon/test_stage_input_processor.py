@@ -42,83 +42,90 @@ def _build_stage(req_id: str, codes, *, finish_reason: str | None, chunk_key: st
     ]
 
 
-def test_stage0_to_stage1_accumulates_chunks_until_finish():
-    stage_proc._REQUEST_CODEC_CHUNKS.clear()
-    try:
-        # First tick: incremental chunk, request not finished yet.
-        stage_list = _build_stage("req-a", [[1, 2, 3], [4, 5, 6]], finish_reason=None, chunk_key="codec_codes_chunk")
-        prompts = stage_proc.stage0_to_stage1(stage_list=stage_list, engine_input_source=[0])
-        assert prompts == []
-
-        # Final tick: append final chunk and flush to Stage-1.
-        stage_list = _build_stage("req-a", [[7, 8, 9]], finish_reason="stop", chunk_key="codec_codes_chunk")
-        prompts = stage_proc.stage0_to_stage1(stage_list=stage_list, engine_input_source=[0])
-        assert len(prompts) == 1
-        assert prompts[0]["prompt_token_ids"] == [1, 2, 3, 4, 5, 6, 7, 8, 9]
-    finally:
-        stage_proc._REQUEST_CODEC_CHUNKS.clear()
+def test_stage0_to_stage1_no_prompt_before_finish():
+    """Stage-1 only emits a prompt once Stage-0 has finished the request."""
+    stage_list = _build_stage("req-a", [[1, 2, 3], [4, 5, 6]], finish_reason=None)
+    prompts = stage_proc.stage0_to_stage1(stage_list=stage_list, engine_input_source=[0])
+    assert prompts == []
 
 
-def test_stage0_to_stage1_handles_cumulative_snapshot_without_duplication():
-    stage_proc._REQUEST_CODEC_CHUNKS.clear()
-    try:
-        # First tick: initial chunk.
-        stage_list = _build_stage("req-b", [[10, 11, 12]], finish_reason=None, chunk_key="codec_codes_chunk")
-        prompts = stage_proc.stage0_to_stage1(stage_list=stage_list, engine_input_source=[0])
-        assert prompts == []
+def test_stage0_to_stage1_emits_on_finish_with_full_payload():
+    """On finish, the full `codec_codes` payload is flattened into the prompt."""
+    stage_list = _build_stage("req-a", [[1, 2, 3], [4, 5, 6], [7, 8, 9]], finish_reason="stop")
+    prompts = stage_proc.stage0_to_stage1(stage_list=stage_list, engine_input_source=[0])
+    assert len(prompts) == 1
+    assert prompts[0]["prompt_token_ids"] == [1, 2, 3, 4, 5, 6, 7, 8, 9]
 
-        # Final tick emits cumulative [old + new]. The processor should
-        # replace the buffer (not append duplicate prefix).
-        stage_list = _build_stage(
-            "req-b", [[10, 11, 12], [13, 14, 15]], finish_reason="stop", chunk_key="codec_codes_chunk"
+
+def test_stage0_to_stage1_falls_back_to_chunk_when_full_absent():
+    """When only `codec_codes_chunk` is present on finish, use it as the payload."""
+    stage_list = _build_stage(
+        "req-b", [[10, 11, 12], [13, 14, 15]], finish_reason="stop", chunk_key="codec_codes_chunk"
+    )
+    prompts = stage_proc.stage0_to_stage1(stage_list=stage_list, engine_input_source=[0])
+    assert len(prompts) == 1
+    assert prompts[0]["prompt_token_ids"] == [10, 11, 12, 13, 14, 15]
+
+
+def test_stage0_to_stage1_handles_flat_1d_payload():
+    """1D flat payloads are normalized to [T, G] before flattening."""
+    stage_list = _build_stage("req-c", [1, 2, 3, 4, 5, 6], finish_reason="stop")
+    prompts = stage_proc.stage0_to_stage1(stage_list=stage_list, engine_input_source=[0])
+    assert len(prompts) == 1
+    assert prompts[0]["prompt_token_ids"] == [1, 2, 3, 4, 5, 6]
+
+
+def test_stage0_to_stage1_prefers_full_payload_over_chunk():
+    """When both `codec_codes` and `codec_codes_chunk` are present, full wins.
+
+    Sync path always receives the completed request output, so `codec_codes`
+    (full) is authoritative and `codec_codes_chunk` is only used as fallback.
+    """
+    stage_list = [
+        _DummyStage(
+            engine_outputs=[
+                _DummyReqOutput(
+                    request_id="req-d",
+                    outputs=[
+                        _DummyChoice(
+                            multimodal_output={
+                                "codec_codes": [[1, 2, 3], [4, 5, 6]],
+                                "codec_codes_chunk": [[7, 8, 9]],
+                            },
+                            finish_reason="stop",
+                        )
+                    ],
+                )
+            ]
         )
-        prompts = stage_proc.stage0_to_stage1(stage_list=stage_list, engine_input_source=[0])
-        assert len(prompts) == 1
-        assert prompts[0]["prompt_token_ids"] == [10, 11, 12, 13, 14, 15]
-    finally:
-        stage_proc._REQUEST_CODEC_CHUNKS.clear()
+    ]
+    prompts = stage_proc.stage0_to_stage1(stage_list=stage_list, engine_input_source=[0])
+    assert len(prompts) == 1
+    assert prompts[0]["prompt_token_ids"] == [1, 2, 3, 4, 5, 6]
 
 
-def test_stage0_to_stage1_dedups_cumulative_snapshot_with_shape_variation():
-    stage_proc._REQUEST_CODEC_CHUNKS.clear()
-    try:
-        # First tick in canonical [T, G].
-        stage_list = _build_stage("req-c", [[1, 2], [3, 4]], finish_reason=None, chunk_key="codec_codes_chunk")
-        prompts = stage_proc.stage0_to_stage1(stage_list=stage_list, engine_input_source=[0])
-        assert prompts == []
+def test_stage0_to_stage1_skips_empty_mm_output():
+    """If the finished output has no codec payload, no prompt is emitted."""
+    stage_list = [
+        _DummyStage(
+            engine_outputs=[
+                _DummyReqOutput(
+                    request_id="req-e",
+                    outputs=[_DummyChoice(multimodal_output={}, finish_reason="stop")],
+                )
+            ]
+        )
+    ]
+    prompts = stage_proc.stage0_to_stage1(stage_list=stage_list, engine_input_source=[0])
+    assert prompts == []
 
-        # Final tick arrives as flattened cumulative snapshot.
-        stage_list = _build_stage("req-c", [1, 2, 3, 4, 5, 6], finish_reason="stop", chunk_key="codec_codes_chunk")
-        prompts = stage_proc.stage0_to_stage1(stage_list=stage_list, engine_input_source=[0])
-        assert len(prompts) == 1
-        assert prompts[0]["prompt_token_ids"] == [1, 2, 3, 4, 5, 6]
-    finally:
-        stage_proc._REQUEST_CODEC_CHUNKS.clear()
 
+def test_stage0_to_stage1_no_module_global_state():
+    """Regression: the module holds no per-request buffer state.
 
-def test_stage0_to_stage1_prefers_incremental_chunk_payload_when_both_present():
-    stage_proc._REQUEST_CODEC_CHUNKS.clear()
-    try:
-        stage_list = [
-            _DummyStage(
-                engine_outputs=[
-                    _DummyReqOutput(
-                        request_id="req-d",
-                        outputs=[
-                            _DummyChoice(
-                                multimodal_output={
-                                    "codec_codes": [[1, 2, 3], [4, 5, 6]],
-                                    "codec_codes_chunk": [[4, 5, 6]],
-                                },
-                                finish_reason="stop",
-                            )
-                        ],
-                    )
-                ]
-            )
-        ]
-        prompts = stage_proc.stage0_to_stage1(stage_list=stage_list, engine_input_source=[0])
-        assert len(prompts) == 1
-        assert prompts[0]["prompt_token_ids"] == [4, 5, 6]
-    finally:
-        stage_proc._REQUEST_CODEC_CHUNKS.clear()
+    Prior to the stateless refactor a module-global `_REQUEST_CODEC_CHUNKS`
+    defaultdict could accumulate entries that were never cleaned up on
+    abort/error. After the refactor those symbols no longer exist.
+    """
+    assert not hasattr(stage_proc, "_REQUEST_CODEC_CHUNKS")
+    assert not hasattr(stage_proc, "_append_request_chunk")

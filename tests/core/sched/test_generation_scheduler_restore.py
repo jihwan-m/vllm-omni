@@ -6,6 +6,7 @@ internal deques but restore_queues() is not called due to an exception,
 those requests are permanently orphaned.
 """
 
+import unittest
 from collections import deque
 
 import pytest
@@ -38,7 +39,7 @@ class FakeAdapter:
         pass
 
 
-class TestRestoreQueuesOnError:
+class TestRestoreQueuesOnError(unittest.TestCase):
     """Verify that restore_queues is called even when rewrapping raises."""
 
     def test_requests_not_lost_on_exception(self):
@@ -51,8 +52,8 @@ class TestRestoreQueuesOnError:
 
         # Step 1: process_pending_chunks moves req-B out
         adapter.process_pending_chunks(waiting=[], running=running)
-        assert running == ["req-A"]
-        assert len(adapter.waiting_for_chunk_running_requests) == 1
+        self.assertEqual(running, ["req-A"])
+        self.assertEqual(len(adapter.waiting_for_chunk_running_requests), 1)
 
         # Step 2: simulate the try/except/finally pattern
         try:
@@ -64,9 +65,9 @@ class TestRestoreQueuesOnError:
             adapter.restore_queues(waiting=[], running=running)
 
         # Step 3: verify request is restored
-        assert adapter.restore_called is True
-        assert "req-B" in running
-        assert len(adapter.waiting_for_chunk_running_requests) == 0
+        self.assertTrue(adapter.restore_called)
+        self.assertIn("req-B", running)
+        self.assertEqual(len(adapter.waiting_for_chunk_running_requests), 0)
 
     def test_requests_lost_without_fix(self):
         """Demonstrate the bug: without restore in except, request is lost."""
@@ -75,7 +76,7 @@ class TestRestoreQueuesOnError:
         running = ["req-A", "req-B"]
 
         adapter.process_pending_chunks(waiting=[], running=running)
-        assert running == ["req-A"]
+        self.assertEqual(running, ["req-A"])
 
         # Simulate the BUGGY code: except without restore
         try:
@@ -84,8 +85,8 @@ class TestRestoreQueuesOnError:
             pass  # Bug: no restore_queues call
 
         # Request is lost!
-        assert "req-B" not in running
-        assert len(adapter.waiting_for_chunk_running_requests) == 1
+        self.assertNotIn("req-B", running)
+        self.assertEqual(len(adapter.waiting_for_chunk_running_requests), 1)
 
     def test_happy_path_restores_via_finally(self):
         """When no exception, restore_queues is still called via finally."""
@@ -101,5 +102,9 @@ class TestRestoreQueuesOnError:
         finally:
             adapter.restore_queues(waiting=[], running=running)
 
-        assert adapter.restore_called is True
-        assert "req-B" in running
+        self.assertTrue(adapter.restore_called)
+        self.assertIn("req-B", running)
+
+
+if __name__ == "__main__":
+    unittest.main()

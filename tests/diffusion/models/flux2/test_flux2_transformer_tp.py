@@ -1,6 +1,7 @@
+from unittest.mock import MagicMock, patch
+
 import pytest
 import torch
-from pytest_mock import MockerFixture
 
 from tests.utils import hardware_test
 from vllm_omni.diffusion.models.flux2.flux2_transformer import (
@@ -11,17 +12,14 @@ from vllm_omni.diffusion.models.flux2.flux2_transformer import (
 
 # Initialize TP group before tests
 @pytest.fixture(scope="function", autouse=True)
-def setup_tp_group(mocker: MockerFixture):
+def setup_tp_group():
     """Set up TP group for each test function"""
-    mocker.patch(
-        "vllm.model_executor.layers.linear.get_tensor_model_parallel_world_size",
-        return_value=2,
-    )
-    mock_get_tp_group = mocker.patch("vllm.distributed.parallel_state.get_tp_group")
-    mock_tp_group = mocker.MagicMock()
-    mock_tp_group.world_size = 2
-    mock_get_tp_group.return_value = mock_tp_group
-    yield
+    with patch("vllm.model_executor.layers.linear.get_tensor_model_parallel_world_size", return_value=2):
+        with patch("vllm.distributed.parallel_state.get_tp_group") as mock_get_tp_group:
+            mock_tp_group = MagicMock()
+            mock_tp_group.world_size = 2
+            mock_get_tp_group.return_value = mock_tp_group
+            yield
 
 
 class TestFlux2TransformerWeightLoading:
